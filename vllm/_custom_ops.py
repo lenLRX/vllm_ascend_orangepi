@@ -28,8 +28,8 @@ with contextlib.suppress(ImportError):
     supports_moe_ops = True
 
 # neuron has torch version that doesn't even have impl_abstract
-if TYPE_CHECKING or current_platform.is_neuron():
-
+#if TYPE_CHECKING or current_platform.is_neuron():
+if True:
     def register_fake(fn):
         return lambda name: fn
 else:

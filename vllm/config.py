@@ -7,6 +7,7 @@ from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Final, List,
                     Literal, Mapping, Optional, Set, Tuple, Type, Union)
 
 import torch
+import torch_npu
 from transformers import PretrainedConfig
 
 import vllm.envs as envs
@@ -1204,6 +1205,8 @@ class DeviceConfig:
                 self.device_type = "cpu"
             elif current_platform.is_xpu():
                 self.device_type = "xpu"
+            elif current_platform.is_npu():
+                self.device_type = "npu"
             else:
                 raise RuntimeError("Failed to infer device type")
         else:

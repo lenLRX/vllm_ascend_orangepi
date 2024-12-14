@@ -37,6 +37,7 @@ DEVICE_OPTIONS = [
     "tpu",
     "xpu",
     "hpu",
+    "npu"
 ]
 
 
@@ -153,7 +154,7 @@ class EngineArgs:
     long_lora_scaling_factors: Optional[Tuple[float]] = None
     lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
     max_cpu_loras: Optional[int] = None
-    device: str = 'auto'
+    device: str = 'npu'
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
     ray_workers_use_nsight: bool = False
