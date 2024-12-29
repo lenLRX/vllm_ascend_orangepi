@@ -13,6 +13,7 @@ from vllm.worker.npu_model_runner import NPUModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
                                      LoraNotSupportedWorkerBase, WorkerBase,
                                      WorkerInput)
+from vllm.worker.cache_engine import CacheEngine
 
 
 class NPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
@@ -38,6 +39,8 @@ class NPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.model_runner: NPUModelRunner = NPUModelRunner(
             vllm_config=vllm_config)
         self.is_driver_worker = True
+        self.cache_engine = None
+        self.npu_cache = None
 
     def init_device(self) -> None:
         self.init_distributed_environment()
@@ -76,6 +79,26 @@ class NPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+        #self.cache_engine = CacheEngine(self.cache_config, self.model_config,
+        #                self.parallel_config, self.device_config)
+        model_config = self.model_config
+        head_size = model_config.get_head_size()
+        # Models like Jamba, have mixed typed layers, E.g Mamba
+        num_attention_layers = model_config.get_num_attention_layers(
+            self.parallel_config)
+        num_kv_heads = model_config.get_num_kv_heads(self.parallel_config)
+
+        self.npu_cache = []
+        for _ in range(num_attention_layers):
+            # null block in CpuGpuBlockAllocator requires at least that
+            # block to be zeroed-out.
+            # We zero-out everything for simplicity.
+            self.npu_cache.append(
+                torch.empty((2, model_config.max_model_len, head_size*num_kv_heads),
+                            dtype=model_config.dtype, device="npu"))
+        self.npu_cache = [self.npu_cache]
+
+
 
     @property
     def do_metadata_broadcast(self) -> bool:
@@ -83,7 +106,7 @@ class NPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     @property
     def kv_cache(self) -> Optional[List[List[torch.Tensor]]]:
-        return None
+        return self.npu_cache
 
     @torch.inference_mode()
     def prepare_worker_input(

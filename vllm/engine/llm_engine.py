@@ -565,6 +565,9 @@ class LLMEngine:
                 "multiprocessing distributed executor backend does not "
                 "support VLLM_USE_RAY_SPMD_WORKER=1")
             executor_class = MultiprocessingGPUExecutor
+        elif engine_config.device_config.device_type == "npu":
+            from vllm.executor.npu_executor import NPUExecutorAsync
+            executor_class = NPUExecutorAsync
         else:
             from vllm.executor.gpu_executor import GPUExecutor
             executor_class = GPUExecutor

@@ -1,7 +1,8 @@
 import os
 from dataclasses import dataclass
 from importlib.util import find_spec
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -10,41 +11,101 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.model_executor.model_loader import get_model
+from vllm.core.scheduler import SchedulerOutputs
+
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalKwargs)
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import is_pin_memory_available, make_tensor_with_pad
 from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
+from vllm.worker.model_runner_base import (
+    ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
+    _add_attn_metadata_broadcastable_dict,
+    _add_sampling_metadata_broadcastable_dict,
+    _init_attn_metadata_from_tensor_dict,
+    _init_sampling_metadata_from_tensor_dict, dump_input_when_exception)
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
 logger = init_logger(__name__)
 
+@dataclass(frozen=False)
+class NPUAttentionMetadata:
+    offsets: Optional[List[int]] = None
+    seq_lens: Optional[List[int]] = None
+
 
 @dataclass(frozen=True)
 class ModelInputForNPU(ModelRunnerInputBase):
     """
-    Used by the NPUModelRunner.
+    This base class contains metadata needed for the base model forward pass
+    but not metadata for possible additional steps, e.g., sampling. Model
+    runners that run additional steps should subclass this method to add
+    additional fields.
     """
     input_tokens: Optional[torch.Tensor] = None
     input_positions: Optional[torch.Tensor] = None
-    input_block_ids: Optional[torch.Tensor] = None
-    sampling_metadata: Optional["SamplingMetadata"] = None
+    seq_lens: Optional[List[int]] = None
+    query_lens: Optional[List[int]] = None
+    #lora_mapping: Optional["LoRAMapping"] = None
+    #lora_requests: Optional[Set[LoRARequest]] = None
+    attn_metadata: Optional["AttentionMetadata"] = None
+    #prompt_adapter_mapping: Optional[PromptAdapterMapping] = None
+    #prompt_adapter_requests: Optional[Set[PromptAdapterRequest]] = None
     multi_modal_kwargs: Optional[BatchedTensorInputs] = None
+    request_ids_to_seq_ids: Optional[Dict[str, List[int]]] = None
+    finished_requests_ids: Optional[List[str]] = None
+    virtual_engine: int = 0
+    async_callback: Optional[Callable] = None
+    #seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None
+    scheduler_outputs: Optional[SchedulerOutputs] = None
+    sampling_metadata: Optional["SamplingMetadata"] = None
 
-    def as_broadcastable_tensor_dict(
-            self) -> Dict[str, Union[int, torch.Tensor]]:
-        raise NotImplementedError("ModelInputForNPU cannot be broadcast.")
+
+    def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
+        tensor_dict = {
+            "input_tokens": self.input_tokens,
+            "input_positions": self.input_positions,
+            "lora_requests": self.lora_requests,
+            "lora_mapping": self.lora_mapping,
+            "multi_modal_kwargs": self.multi_modal_kwargs,
+            "prompt_adapter_mapping": self.prompt_adapter_mapping,
+            "prompt_adapter_requests": self.prompt_adapter_requests,
+            "virtual_engine": self.virtual_engine,
+            "request_ids_to_seq_ids": self.request_ids_to_seq_ids,
+            "finished_requests_ids": self.finished_requests_ids,
+        }
+        _add_attn_metadata_broadcastable_dict(tensor_dict, self.attn_metadata)
+        _add_sampling_metadata_broadcastable_dict(tensor_dict,
+                                                  self.sampling_metadata)
+
+        return tensor_dict
 
     @classmethod
     def from_broadcasted_tensor_dict(
         cls,
         tensor_dict: Dict[str, Any],
         attn_backend: Optional["AttentionBackend"] = None,
-    ) -> "ModelInputForNPU":
-        assert attn_backend is None
-        return cls.from_broadcasted_tensor_dict(tensor_dict)
+    ):
+        if attn_backend is not None:
+            tensor_dict = _init_attn_metadata_from_tensor_dict(
+                attn_backend, tensor_dict)
+        return cls(**tensor_dict)
+
+    # Exclude `async_callback` to be able to pickle this object
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state["async_callback"]
+        return state
+
+    # TODO: What happens when we depickle this object?
+    # How can we update this callback to properly pass it to the engine?
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__dict__.update({'async_callback': None})
+
 
 
 class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
@@ -75,9 +136,10 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
 
     def load_model(self) -> None:
-        self.model = None
-        logger.warning("npu load_model not implemented")
-        
+        logger.info(f"Starting to load model {self.model_config.model} ...")
+        logger.info(f"load_model config: {self.model_config}")
+        self.model = get_model(vllm_config=self.vllm_config).npu()
+
         
     def _prepare_prompt(
         self,
@@ -87,7 +149,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
-        input_block_ids: List[int] = []
+        input_offsets: List[int] = []
+        input_lengths: List[int] = []
 
         seq_lens: List[int] = []
         multi_modal_kwargs_list: List[MultiModalKwargs] = []
@@ -102,13 +165,16 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             seq_len = len(prompt_tokens)
             seq_lens.append(seq_len)
 
+            input_offsets.append(0)
+            input_lengths.append(seq_len)
+
             input_tokens.append(prompt_tokens)
             input_positions.append(list(range(seq_len)))
 
             assert seq_group_metadata.block_tables is not None
             block_table = seq_group_metadata.block_tables[seq_id]
-            assert len(block_table) == 1
-            input_block_ids.append(block_table[0])
+            logger.info(f"block_table {block_table}")
+            #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
             if mm_data:
@@ -134,13 +200,11 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                                                max_len=max_seq_len,
                                                dtype=torch.long,
                                                device=self.device)
-        input_block_ids = torch.tensor(input_block_ids,
-                                       dtype=torch.long,
-                                       device=self.device)
+
 
         multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
 
-        return (input_tokens, input_positions, input_block_ids, seq_lens,
+        return (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
                 multi_modal_kwargs)
 
     def _prepare_decode(
@@ -150,7 +214,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
-        input_block_ids: List[int] = []
+        input_offsets: List[int] = []
+        input_lengths: List[int] = []
         context_lens: List[int] = []
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -168,10 +233,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 input_positions.append([position])
                 context_lens.append(seq_len)
 
-                assert seq_group_metadata.block_tables is not None
-                block_table = seq_group_metadata.block_tables[seq_id]
-                assert len(block_table) == 1
-                input_block_ids.append(block_table[0])
+                input_offsets.append(position)
+                input_lengths.append(1)
 
         input_tokens = make_tensor_with_pad(input_tokens,
                                             pad=0,
@@ -186,11 +249,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         context_lens = torch.tensor(context_lens,
                                     dtype=torch.int,
                                     device=self.device)
-        input_block_ids = torch.tensor(input_block_ids,
-                                       dtype=torch.long,
-                                       device=self.device)
 
-        return input_tokens, input_positions, input_block_ids
+        return input_tokens, input_positions, input_offsets, input_lengths
 
     def make_model_input_from_broadcasted_tensor_dict(
             self, tensor_dict: Dict[str, Any]) -> ModelInputForNPU:
@@ -208,12 +268,12 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         is_prompt = seq_group_metadata_list[0].is_prompt
         # Prepare input tensors.
         if is_prompt:
-            (input_tokens, input_positions, input_block_ids, seq_lens,
+            (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
              multi_modal_kwargs
              ) = self._prepare_prompt(seq_group_metadata_list)
         else:
             (input_tokens, input_positions,
-             input_block_ids) = self._prepare_decode(seq_group_metadata_list)
+             input_offsets, input_lengths) = self._prepare_decode(seq_group_metadata_list)
             seq_lens = None
         sampling_metadata = SamplingMetadata.prepare(
             seq_group_metadata_list,
@@ -222,27 +282,17 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             self.device,
             self.pin_memory,
             generators=self.get_generators(finished_requests_ids))
-
-        if not self._on_device_sampling_disabled:
-            # Once the request IDs are changed in current iteration, we will
-            # update the on-device sampling parameters.
-            current_batch_request_ids = [
-                seq_group_meta_data.request_id
-                for seq_group_meta_data in seq_group_metadata_list
-            ]
-            if current_batch_request_ids != self._previous_batch_request_ids:
-                self._update_npu_sampling_params(sampling_metadata)
-                self._previous_batch_request_ids = current_batch_request_ids
+        attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths)
 
         return ModelInputForNPU(input_tokens=input_tokens,
-                                   input_positions=input_positions,
-                                   input_block_ids=input_block_ids,
-                                   sampling_metadata=sampling_metadata,
-                                   multi_modal_kwargs=multi_modal_kwargs)
+                                input_positions=input_positions,
+                                sampling_metadata=sampling_metadata,
+                                attn_metadata=attn_metadata,
+                                multi_modal_kwargs=multi_modal_kwargs)
 
     def _update_npu_sampling_params(self,
                                        sampling_metadata: SamplingMetadata):
-        current_sampling_params = self.model_config.npu_sampling_params
+        current_sampling_params = self.model_config.sampling_params
         assert current_sampling_params is not None, (
             f"Failed to update sampling_params, "
             f"current sampling params is {current_sampling_params}")
@@ -261,6 +311,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
 
     @torch.inference_mode()
+    @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
     def execute_model(
         self,
         model_input: ModelInputForNPU,
@@ -271,28 +322,30 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         if num_steps > 1:
             raise ValueError(
                 "NPUModelRunner does not support multi-step execution.")
-
+        logger.info(f"input_tokens {model_input.input_tokens}")
+        logger.info(f"input_positions {model_input.input_positions}")
         hidden_states = self.model(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
-            input_block_ids=model_input.input_block_ids,
+            kv_caches=kv_caches,
+            attn_metadata=model_input.attn_metadata,
+            intermediate_tensors=intermediate_tensors,
             **MultiModalKwargs.as_kwargs(model_input.multi_modal_kwargs or {},
                                          device=self.device),
         )
+        logger.info(f"inference_dome")
 
         # Compute the logits only if the on-device sampling is turned off as
         # on-device sampling outputs the token ids.
-        if self._on_device_sampling_disabled:
-            logits = self.model.compute_logits(hidden_states,
+        logits = self.model.compute_logits(hidden_states,
                                                model_input.sampling_metadata)
-        else:
-            logits = hidden_states
-
+        logger.info(f"compute_logits done")
         # Sample the next token.
         output = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
+        logger.info(f"sample done")
         return [output]
 
     @property
