@@ -25,10 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import acl
 
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
-from vllm.model_executor.layers.npu.py_npu_ops import rope_layer
+from vllm.model_executor.layers.npu.py_npu_ops import rope_layer_vllm
 
 
 
@@ -956,15 +957,14 @@ class NPURotaryEmbedding(torch.nn.Module):
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
-        self.hidden_dim = rotary_dim * 2
-        self.head_num = self.hidden_dim // self.head_size
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
+        # keep fp32 dtype
+        #cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -982,11 +982,11 @@ class NPURotaryEmbedding(torch.nn.Module):
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
-
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
+        assert cache.is_contiguous()
         return cache
 
     def forward(
@@ -1004,12 +1004,30 @@ class NPURotaryEmbedding(torch.nn.Module):
         start_pos = positions[0].item()
         num_tokens = positions.shape[0]
 
+        #print(f"query shape {query.shape} stride {query.stride()}")
+        #print(f"key shape {key.shape} stride {key.stride()}")
+        #print(f"cache shape {self.cos_sin_cache.shape} stride {self.cos_sin_cache.stride()}")
+
+        hidden_dim = query.shape[-1]
+        head_num = hidden_dim // self.head_size
+        
+        #print(f"rope forward is_neox_style {self.is_neox_style} start_pos {start_pos}, num_tokens {num_tokens}")
+        #print(f"hidden_dim {hidden_dim}, head_num {head_num}")
+        #print("cache", self.cos_sin_cache.cpu().reshape(-1)[:8])
+        #print("cache", self.cos_sin_cache.cpu().reshape(-1)[64:64+8])
+
+        assert query.is_contiguous()
+        assert key.is_contiguous()
+
+        #query.cpu().numpy().tofile("rope_input_query.bin")
+        #key.cpu().numpy().tofile("rope_input_key.bin")
+        #self.cos_sin_cache.cpu().numpy().tofile("cos_sin_cache.bin")
+
         # TODO gather rope
-        hidden_dim = self.rotary_dim * 2
-        rope_layer(get_pointer(output_q), get_pointer(output_k),
+        rope_layer_vllm(get_pointer(output_q), get_pointer(output_k),
                    get_pointer(self.cos_sin_cache),
                    get_pointer(query), get_pointer(key),
-                   start_pos, num_tokens, self.head_num, self.hidden_dim, self.is_neox_style,
+                   start_pos, num_tokens, head_num, hidden_dim, self.is_neox_style,
                    DataType.DT_FLOAT16, get_default_stream())
         return output_q, output_k
 

@@ -104,14 +104,10 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata,
         attn_type: AttentionType = AttentionType.DECODER,
     ) -> torch.Tensor:
-        print(f"q shape {query.shape} k shape {key.shape}, v shape {value.shape}, kv_cache shape {kv_cache.shape}")
-        print(f"attn_metadata {repr(attn_metadata)}")
-        print(f"offsets {attn_metadata.offsets} seqlens {attn_metadata.seq_lens}")
-        tmp_seq_len = attn_metadata.seq_lens[0]
-        print(tmp_seq_len, type(tmp_seq_len))
-        if type(tmp_seq_len) == list:
-            for x in tmp_seq_len:
-                print(np.asarray(x))
+        #print(f"q shape {query.shape} k shape {key.shape}, v shape {value.shape}, kv_cache shape {kv_cache.shape}")
+        #print(f"attn_metadata {repr(attn_metadata)}")
+        #print(f"offsets: {attn_metadata.offsets[0]}")
+        assert len(attn_metadata.offsets) == 1
         copy_offset = attn_metadata.offsets[0]
         copy_bytes = attn_metadata.seq_lens[0] * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
         k_cache_base = kv_cache[0, copy_offset, :]
@@ -121,7 +117,7 @@ class Attention(nn.Module):
         # update k_cache
         ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes, key.data_ptr(), copy_bytes, 3, get_default_stream())
         assert ret == 0, "failed to copy k cache"
-        ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes, key.data_ptr(), copy_bytes, 3, get_default_stream())
+        ret = acl.rt.memcpy_async(v_cache_base.data_ptr(), copy_bytes, value.data_ptr(), copy_bytes, 3, get_default_stream())
         assert ret == 0, "failed to copy v cache"
 
         cur_pos = attn_metadata.offsets[0] + attn_metadata.seq_lens[0]
@@ -134,7 +130,7 @@ class Attention(nn.Module):
         softmax_output = torch.empty((hs, cur_pos), dtype=torch.float16, device="npu")
         softmax_layer(get_pointer(softmax_output), get_pointer(q_matmul_k), hs, cur_pos, DataType.DT_FLOAT16, get_default_stream())
 
-        tmp_output = torch.empty((self.hidden_dim, attn_metadata.seq_lens[0]), dtype=torch.float16, device="npu")
+        tmp_output = torch.empty((attn_metadata.seq_lens[0], self.hidden_dim), dtype=torch.float16, device="npu")
         batch_matmul_trans_v_layer(get_pointer(tmp_output), get_pointer(softmax_output), get_pointer(v_cache),
                                    self.num_heads, attn_metadata.seq_lens[0], self.head_size, cur_pos, 1.0,
                                    DataType.DT_FLOAT16, get_default_stream())

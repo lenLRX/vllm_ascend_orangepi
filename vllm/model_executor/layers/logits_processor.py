@@ -11,6 +11,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
+from vllm.model_executor.layers.npu.py_npu_ops import gather_layer
+
 
 
 class LogitsProcessor(nn.Module):
@@ -85,7 +88,9 @@ class LogitsProcessor(nn.Module):
         logits = lm_head.linear_method.apply(lm_head,
                                              hidden_states,
                                              bias=embedding_bias)
-        if self.use_gather:
+        if current_platform.is_npu():
+            logits = logits
+        elif self.use_gather:
             # None may be returned for rank > 0
             logits = tensor_model_parallel_gather(logits)
         else:
@@ -96,7 +101,7 @@ class LogitsProcessor(nn.Module):
             # should execute the same operations after gathering the logits.
             logits = tensor_model_parallel_all_gather(logits)
         # Remove paddings in vocab (if any).
-        if logits is not None:
+        if logits is not None and self.org_vocab_size > self.vocab_size :
             logits = logits[..., :self.org_vocab_size]
         return logits
 
@@ -115,8 +120,19 @@ def _prune_hidden_states(
     # (warmup, profile_run) we might not have selected_token_indices,
     # so we skip pruning.
     if sampling_metadata.selected_token_indices is not None:
-        return hidden_states.index_select(
-            0, sampling_metadata.selected_token_indices)
+        #gather
+        assert sampling_metadata.selected_token_indices.dtype ==  torch.int64
+        first_dim = sampling_metadata.selected_token_indices.reshape(-1).shape[0]
+        last_dim = hidden_states.shape[-1]
+        output = torch.empty((first_dim,) + hidden_states.shape[1:], dtype=hidden_states.dtype, device="npu")
+        gather_layer(get_pointer(output), get_pointer(hidden_states),
+                     get_pointer(sampling_metadata.selected_token_indices), 
+                     first_dim, last_dim,
+                     DataType.DT_INT64, DataType.DT_FLOAT16, get_default_stream())
+
+        return output
+        #return hidden_states.index_select(
+        #    0, sampling_metadata.selected_token_indices)
     else:
         return hidden_states
 

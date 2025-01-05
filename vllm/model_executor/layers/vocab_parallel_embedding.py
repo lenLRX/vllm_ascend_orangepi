@@ -14,6 +14,10 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
+from vllm.model_executor.layers.npu.py_npu_ops import gather_layer, matmul_weight_transpose_layer, matmul_nz_layer
+import acl
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 
@@ -38,11 +42,30 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
+        assert bias is None
+        n, k = layer.weight.shape
+        m = x.reshape(-1, k).shape[0]
+
+        #print(f"lm_head forward m: {m} n: {n} k: {k}")
+        output = torch.empty(x.shape[:-1] + (n,), dtype=layer.weight.dtype, device="npu")
+        matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(layer.weight),
+                        m, n, k, DataType.DT_FLOAT16, get_default_stream())
+        acl.rt.synchronize_stream(get_default_stream())
+        return output
+
 
     def embedding(self, layer: torch.nn.Module,
                   input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
+        #print(f"embedding input shape: {input_.shape} dtype {input_.dtype}, weight shape {layer.weight.shape} dtype {layer.weight.dtype}")
+        assert input_.dtype ==  torch.int64
+        first_dim = input_.reshape(-1).shape[0]
+        last_dim = layer.weight.shape[-1]
+        output = torch.empty(input_.shape + (last_dim,), dtype=layer.weight.dtype, device="npu")
+        #return F.embedding(input_, layer.weight)
+        gather_layer(get_pointer(output), get_pointer(layer.weight),
+                     get_pointer(input_), first_dim, last_dim,
+                     DataType.DT_INT64, DataType.DT_FLOAT16, get_default_stream())
+        return output
 
 
 def pad_vocab_size(vocab_size: int,
@@ -382,9 +405,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == self.org_vocab_size
 
         # Copy the data.
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        if not current_platform.is_npu():
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
-        if current_platform.is_hpu():
+        if current_platform.is_npu():
+            param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+        elif current_platform.is_hpu():
             # FIXME(kzawora): Weight copy with slicing bugs out on Gaudi here,
             # so we're using a workaround. Remove this when fixed in
             # HPU PT bridge.
@@ -467,6 +493,25 @@ class ParallelLMHead(VocabParallelEmbedding):
             })
         else:
             self.register_parameter("bias", None)
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        print("LMHead weight loader")
+
+        n, k = loaded_weight.shape
+        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        print(f"param shape: {param.shape}")
+        print(f"weight content: {loaded_weight[0]}")
+        print(f"param name {param.name}")
+        loaded_weight = loaded_weight.npu()
+        tranposed_weight = torch.empty_like(loaded_weight)
+        n, k = loaded_weight.shape
+        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        matmul_weight_transpose_layer(get_pointer(tranposed_weight), get_pointer(loaded_weight), 
+                                      n, k, DataType.DT_FLOAT16, get_default_stream())
+        acl.rt.synchronize_stream(get_default_stream())
+        loaded_weight = tranposed_weight.cpu()
+
+        param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):
         """Tie the weights with word embeddings."""

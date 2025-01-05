@@ -173,7 +173,6 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
             assert seq_group_metadata.block_tables is not None
             block_table = seq_group_metadata.block_tables[seq_id]
-            logger.info(f"block_table {block_table}")
             #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
@@ -190,6 +189,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
+        assert len(input_tokens) == 1
         input_tokens = make_tensor_with_pad(input_tokens,
                                             pad=0,
                                             max_len=max_seq_len,
@@ -235,7 +235,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
                 input_offsets.append(position)
                 input_lengths.append(1)
-
+        assert len(input_tokens) == 1
         input_tokens = make_tensor_with_pad(input_tokens,
                                             pad=0,
                                             max_len=1,
@@ -279,9 +279,10 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             seq_group_metadata_list,
             seq_lens,
             seq_lens,
-            self.device,
+            "cpu", #self.device,
             self.pin_memory,
             generators=self.get_generators(finished_requests_ids))
+        sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.npu()
         attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths)
 
         return ModelInputForNPU(input_tokens=input_tokens,
@@ -322,8 +323,9 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         if num_steps > 1:
             raise ValueError(
                 "NPUModelRunner does not support multi-step execution.")
-        logger.info(f"input_tokens {model_input.input_tokens}")
-        logger.info(f"input_positions {model_input.input_positions}")
+        #logger.info(f"input_tokens {model_input.input_tokens}")
+        #logger.info(f"input_positions {model_input.input_positions}")
+        # TODO split batch and merge
         hidden_states = self.model(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
@@ -333,19 +335,20 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             **MultiModalKwargs.as_kwargs(model_input.multi_modal_kwargs or {},
                                          device=self.device),
         )
-        logger.info(f"inference_dome")
+        #logger.info(f"inference_dome")
 
         # Compute the logits only if the on-device sampling is turned off as
         # on-device sampling outputs the token ids.
         logits = self.model.compute_logits(hidden_states,
                                                model_input.sampling_metadata)
-        logger.info(f"compute_logits done")
+        #logger.info(f"compute_logits done")
+        logits = logits.cpu()
         # Sample the next token.
         output = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
-        logger.info(f"sample done")
+        #logger.info(f"sample done")
         return [output]
 
     @property

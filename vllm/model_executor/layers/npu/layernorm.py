@@ -39,6 +39,7 @@ class RMSNorm(torch.nn.Module):
             add_out = torch.empty_like(x)
             add_layer(get_pointer(add_out), get_pointer(x), get_pointer(residual),
                       x.numel(), DataType.DT_FLOAT16, get_default_stream())
+            residual = add_out
 
 
         assert x.dtype == torch.float16

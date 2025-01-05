@@ -52,6 +52,17 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
+from vllm.model_executor.layers.npu.py_npu_ops import split_qkv_layer
+
+import acl
+
+def print_tensor(name, x):
+    return
+    acl.rt.synchronize_stream(get_default_stream())
+    x = x.cpu()[...,:4, :8]
+    print(name, x)
+
 
 class LlamaMLP(nn.Module):
 
@@ -178,11 +189,31 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        print_tensor("input hidden_states", hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print_tensor("qkv", qkv)
+        qkv_last_dim = qkv.shape[-1]
+        token_num = qkv.reshape(-1, qkv_last_dim).shape[0]
+        q = torch.empty(qkv.shape[:-1] + (self.q_size,), dtype=qkv.dtype, device="npu")
+        k = torch.empty(qkv.shape[:-1] + (self.kv_size,), dtype=qkv.dtype, device="npu")
+        v = torch.empty(qkv.shape[:-1] + (self.kv_size,), dtype=qkv.dtype, device="npu")
+        split_qkv_layer(get_pointer(q), get_pointer(k), get_pointer(v), get_pointer(qkv),
+                        token_num, self.q_size, self.kv_size, self.kv_size,
+                        DataType.DT_FLOAT16, get_default_stream())
+        #q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        #q = q.contiguous()
+        #k = k.contiguous()
+        #v = v.contiguous()
+        print_tensor("q_split", q)
+        print_tensor("k_split", k)
+        print_tensor("v_split", v)
         q, k = self.rotary_emb(positions, q, k)
+        print_tensor("q_emb", q)
+        print_tensor("k_emb", k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        print_tensor("attn_output", attn_output)
         output, _ = self.o_proj(attn_output)
+        print_tensor("output", output)
         return output
 
 
@@ -249,8 +280,13 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            print_tensor("hidden_states before input_layernorm", hidden_states)
+            print_tensor("residual before input_layernorm", residual)
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            print_tensor("hidden_states after input_layernorm", hidden_states)
+            print_tensor("residual after input_layernorm", residual)
+
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
@@ -259,6 +295,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        print_tensor("residual after post_attention_layernorm", residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -316,12 +353,18 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
+        print_tensor("emb hidden_states", hidden_states)
+
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches[i - self.start_layer],
                                             attn_metadata, residual)
+            print_tensor(f"layer {i} hidden_states", hidden_states)
+            if residual is not None:
+                print_tensor(f"layer {i} residual", residual)
+
 
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -372,6 +415,7 @@ class LlamaModel(nn.Module):
 
                 break
             else:
+                #print(f"for else name {name} param {params_dict[name]}")
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue

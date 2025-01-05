@@ -9,8 +9,8 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 
-from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
-from vllm.model_executor.layers.npu.py_npu_ops import matmul_nz_awq_4bit_layer
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType, NPUTimer
+from vllm.model_executor.layers.npu.py_npu_ops import matmul_nz_awq_4bit_layer, convert_awq_4bit_qweight
 
 
 
@@ -162,23 +162,28 @@ class AWQLinearMethod(LinearMethodBase):
         #print(f"qzeros shape {np_qzeros.shape}")
 
         np_qweight = np_qweight.view("uint8")
-        k_dim, n_dim = np_qweight.shape
-        np_qweight = np_qweight.reshape(k_dim, n_dim, 1)
-        np_qweight = np.repeat(np_qweight, 2, axis=-1)
-        np_qweight[..., 0] = np_qweight[..., 0] & 0xf
-        np_qweight[..., 1] = (np_qweight[..., 1] >> 4) & 0xf
-        n_dim = n_dim * 2
-        np_qweight = np_qweight.reshape(k_dim, n_dim//8, 2, 4)
-        np_qweight = np.transpose(np_qweight, (0, 1, 3, 2))
-        # transpose to (k, n)
-        np_qweight = np_qweight.reshape(k_dim//16, 16, n_dim)
-        np_qweight = np.transpose(np_qweight, (0, 2, 1))
-        d1 = np_qweight.size // 512
-        np_qweight  = np_qweight.reshape(d1, 4, 64, 2)
-        np_qweight = np.transpose(np_qweight, (0, 2, 1, 3))
-        np_qweight = (np_qweight + 8)&0xf
-        np_qweight[..., 0] = np_qweight[..., 0] | (np_qweight[...,1] << 4)
-        np_qweight = np.ascontiguousarray(np_qweight[..., 0]).view(original_qweight_dtype).reshape(original_qweight_shape)
+        if False:
+            k_dim, n_dim = np_qweight.shape
+            np_qweight = np_qweight.reshape(k_dim, n_dim, 1)
+            np_qweight = np.repeat(np_qweight, 2, axis=-1)
+            np_qweight[..., 0] = np_qweight[..., 0] & 0xf
+            np_qweight[..., 1] = (np_qweight[..., 1] >> 4) & 0xf
+            n_dim = n_dim * 2
+            np_qweight = np_qweight.reshape(k_dim, n_dim//8, 2, 4)
+            np_qweight = np.transpose(np_qweight, (0, 1, 3, 2))
+            # transpose to (k, n)
+            np_qweight = np_qweight.reshape(k_dim//16, 16, n_dim)
+            np_qweight = np.transpose(np_qweight, (0, 2, 1))
+            d1 = np_qweight.size // 512
+            np_qweight  = np_qweight.reshape(d1, 4, 64, 2)
+            np_qweight = np.transpose(np_qweight, (0, 2, 1, 3))
+            np_qweight = (np_qweight + 8)&0xf
+            np_qweight[..., 0] = np_qweight[..., 0] | (np_qweight[...,1] << 4)
+            np_qweight = np.ascontiguousarray(np_qweight[..., 0]).view(original_qweight_dtype).reshape(original_qweight_shape)
+        else:
+            np_qweight_cpp = np.zeros_like(np_qweight)
+            convert_awq_4bit_qweight(np_qweight, np_qweight_cpp)
+            np_qweight = np_qweight_cpp.view(original_qweight_dtype).reshape(original_qweight_shape)
 
         np_qzeros = np_qzeros.view("uint8")
         k_dim, n_dim = np_qzeros.shape
@@ -212,14 +217,18 @@ class AWQLinearMethod(LinearMethodBase):
         out_shape = (x.shape[:-1] + (qweight.shape[-1] * pack_factor, ))
         reshaped_x = x.reshape(-1, x.shape[-1])
         out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-        print(f"input shape: {x.shape}, qweight shape: {qweight.shape}, qweight dtype {qweight.dtype}, pack_factor {pack_factor}")
+        #print(f"input shape: {x.shape}, qweight shape: {qweight.shape}, qweight dtype {qweight.dtype}, pack_factor {pack_factor}")
         k, n = qweight.shape
         n *= pack_factor
         m, k = x.reshape(-1, k).shape
 
+        assert m < 4096
 
-        matmul_nz_awq_4bit_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
-                                 m, n, k, DataType.DT_FLOAT16, get_default_stream())
+        #with NPUTimer(get_default_stream()) as timer:
+        if True:
+            matmul_nz_awq_4bit_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
+                                     m, n, k, DataType.DT_FLOAT16, get_default_stream())
+        #print(f"awq 4bit matmul m: {m} n: {n} k: {k} duration: {timer.duration:.4f} ms")
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)

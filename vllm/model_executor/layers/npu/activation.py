@@ -9,7 +9,7 @@ class SiluAndMul:
         pass
 
     def __call__(self, x):
-        print(f"SiluAndMul input shape {x.shape}")
+        #print(f"SiluAndMul input shape {x.shape}")
         output_shape = list(x.shape)
         output_shape[-1] = output_shape[-1] // 2
         last_dim = output_shape[-1]
