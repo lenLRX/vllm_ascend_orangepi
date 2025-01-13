@@ -35,6 +35,8 @@ logger = init_logger(__name__)
 class NPUAttentionMetadata:
     offsets: Optional[List[int]] = None
     seq_lens: Optional[List[int]] = None
+    block_tables: Optional[List] = None
+    is_prompt: bool = None
 
 
 @dataclass(frozen=True)
@@ -144,13 +146,13 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int],
-               BatchedTensorInputs]:
+    ):
         assert len(seq_group_metadata_list) > 0
-        input_tokens: List[List[int]] = []
+        input_tokens: List[int] = []
         input_positions: List[List[int]] = []
         input_offsets: List[int] = []
         input_lengths: List[int] = []
+        input_block_tables = []
 
         seq_lens: List[int] = []
         multi_modal_kwargs_list: List[MultiModalKwargs] = []
@@ -168,11 +170,14 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             input_offsets.append(0)
             input_lengths.append(seq_len)
 
-            input_tokens.append(prompt_tokens)
-            input_positions.append(list(range(seq_len)))
+            #input_tokens.append(prompt_tokens)
+            input_tokens.extend(prompt_tokens)
+            input_positions.extend(list(range(seq_len)))
 
             assert seq_group_metadata.block_tables is not None
+            logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
             block_table = seq_group_metadata.block_tables[seq_id]
+            input_block_tables.append(block_table)
             #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
@@ -189,68 +194,81 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
-        assert len(input_tokens) == 1
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            pad=0,
-                                            max_len=max_seq_len,
-                                            dtype=torch.long,
-                                            device=self.device)
-        input_positions = make_tensor_with_pad(input_positions,
-                                               pad=0,
-                                               max_len=max_seq_len,
-                                               dtype=torch.long,
-                                               device=self.device)
+        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        #assert len(input_tokens) == 1
+        #input_tokens = make_tensor_with_pad(input_tokens,
+        #                                    pad=0,
+        #                                    max_len=max_seq_len,
+        #                                    dtype=torch.long,
+        #                                    device=self.device)
+        #input_positions = make_tensor_with_pad(input_positions,
+        #                                       pad=0,
+        #                                       max_len=max_seq_len,
+        #                                       dtype=torch.long,
+        #                                       device=self.device)
 
 
         multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
 
         return (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
-                multi_modal_kwargs)
+                multi_modal_kwargs, input_block_tables)
 
     def _prepare_decode(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
         input_offsets: List[int] = []
         input_lengths: List[int] = []
         context_lens: List[int] = []
+        input_block_tables = []
 
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
 
+            assert seq_group_metadata.block_tables is not None
+            #logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
+
             for seq_id in seq_ids:
                 seq_data = seq_group_metadata.seq_data[seq_id]
                 generation_token = seq_data.get_last_token_id()
-                input_tokens.append([generation_token])
+                input_tokens.append(generation_token)
 
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
-                input_positions.append([position])
+                input_positions.append(position)
                 context_lens.append(seq_len)
 
                 input_offsets.append(position)
                 input_lengths.append(1)
-        assert len(input_tokens) == 1
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            pad=0,
-                                            max_len=1,
-                                            dtype=torch.long,
-                                            device=self.device)
-        input_positions = make_tensor_with_pad(input_positions,
-                                               pad=0,
-                                               max_len=1,
-                                               dtype=torch.long,
-                                               device=self.device)
+
+                block_table = seq_group_metadata.block_tables[seq_id]
+                input_block_tables.append(block_table)
+
+        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+
+        #assert len(input_tokens) == 1
+        #input_tokens = make_tensor_with_pad(input_tokens,
+        #                                    pad=0,
+        #                                    max_len=1,
+        #                                    dtype=torch.long,
+        #                                    device=self.device)
+        #input_positions = make_tensor_with_pad(input_positions,
+        #                                       pad=0,
+        #                                       max_len=1,
+        #                                       dtype=torch.long,
+        #                                       device=self.device)
         context_lens = torch.tensor(context_lens,
                                     dtype=torch.int,
                                     device=self.device)
 
-        return input_tokens, input_positions, input_offsets, input_lengths
+        return input_tokens, input_positions, input_offsets, input_lengths, input_block_tables
 
     def make_model_input_from_broadcasted_tensor_dict(
             self, tensor_dict: Dict[str, Any]) -> ModelInputForNPU:
@@ -269,11 +287,11 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         # Prepare input tensors.
         if is_prompt:
             (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
-             multi_modal_kwargs
+             multi_modal_kwargs, input_block_tables
              ) = self._prepare_prompt(seq_group_metadata_list)
         else:
             (input_tokens, input_positions,
-             input_offsets, input_lengths) = self._prepare_decode(seq_group_metadata_list)
+             input_offsets, input_lengths, input_block_tables) = self._prepare_decode(seq_group_metadata_list)
             seq_lens = None
         sampling_metadata = SamplingMetadata.prepare(
             seq_group_metadata_list,
@@ -283,7 +301,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             self.pin_memory,
             generators=self.get_generators(finished_requests_ids))
         sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.npu()
-        attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths)
+        attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths,
+                                             block_tables=input_block_tables, is_prompt=is_prompt)
 
         return ModelInputForNPU(input_tokens=input_tokens,
                                 input_positions=input_positions,

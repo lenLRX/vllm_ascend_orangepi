@@ -66,6 +66,7 @@ class Attention(nn.Module):
         self.head_size = head_size
         self.hidden_dim = self.num_heads * self.head_size
         self.scale = scale
+        self.block_size = block_size
 
         # The default k/v_scale is set to 1.0. This is ignored
         # when kv-cache is not fp8, and should be used with
@@ -106,34 +107,97 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         #print(f"q shape {query.shape} k shape {key.shape}, v shape {value.shape}, kv_cache shape {kv_cache.shape}")
         #print(f"attn_metadata {repr(attn_metadata)}")
-        #print(f"offsets: {attn_metadata.offsets[0]}")
-        assert len(attn_metadata.offsets) == 1
-        copy_offset = attn_metadata.offsets[0]
-        copy_bytes = attn_metadata.seq_lens[0] * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
-        k_cache_base = kv_cache[0, copy_offset, :]
-        v_cache_base = kv_cache[1, copy_offset, :]
-        k_cache = kv_cache[0, ...]
-        v_cache = kv_cache[1, ...]
-        # update k_cache
-        ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes, key.data_ptr(), copy_bytes, 3, get_default_stream())
-        assert ret == 0, "failed to copy k cache"
-        ret = acl.rt.memcpy_async(v_cache_base.data_ptr(), copy_bytes, value.data_ptr(), copy_bytes, 3, get_default_stream())
-        assert ret == 0, "failed to copy v cache"
+        #print(f"offsets: {attn_metadata.offsets}")
+        #print(f"seq_lens: {attn_metadata.seq_lens}")
+        #print(f"block_tables: {attn_metadata.block_tables}")
+        batch_token_num, hidden_dim = query.shape
 
-        cur_pos = attn_metadata.offsets[0] + attn_metadata.seq_lens[0]
+        tmp_output = torch.empty((batch_token_num, self.hidden_dim), dtype=torch.float16, device="npu")
+        block_bytes = self.block_size * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
 
-        q_matmul_k = torch.empty((self.num_heads, cur_pos, attn_metadata.seq_lens[0]), dtype=torch.float16, device="npu")
-        batch_matmul_qk_trans_causual_layer(get_pointer(q_matmul_k), get_pointer(query), get_pointer(k_cache),
-                                            self.num_heads, attn_metadata.seq_lens[0], cur_pos, self.head_size, attn_metadata.offsets[0],
-                                            self.scale, DataType.DT_FLOAT16, get_default_stream())
-        hs = self.num_heads * attn_metadata.seq_lens[0]
-        softmax_output = torch.empty((hs, cur_pos), dtype=torch.float16, device="npu")
-        softmax_layer(get_pointer(softmax_output), get_pointer(q_matmul_k), hs, cur_pos, DataType.DT_FLOAT16, get_default_stream())
+        batch_size = len(attn_metadata.seq_lens)
+        flat_seq_offset = 0
+        for batch_i in range(batch_size):
+            #print(f"key[{batch_i}]", key[batch_i].cpu())
 
-        tmp_output = torch.empty((attn_metadata.seq_lens[0], self.hidden_dim), dtype=torch.float16, device="npu")
-        batch_matmul_trans_v_layer(get_pointer(tmp_output), get_pointer(softmax_output), get_pointer(v_cache),
-                                   self.num_heads, attn_metadata.seq_lens[0], self.head_size, cur_pos, 1.0,
-                                   DataType.DT_FLOAT16, get_default_stream())
+            # update kv cache
+            curr_seq_len = attn_metadata.seq_lens[batch_i]
+            curr_offset = attn_metadata.offsets[batch_i]
+            remain_seq_len = curr_seq_len
+            curr_block_table = attn_metadata.block_tables[batch_i]
+            offset_in_block = curr_offset % self.block_size
+            block_table_i = curr_offset // self.block_size
+
+            curr_seq_offset = 0
+            while remain_seq_len > 0:
+                copy_seq_len = min(self.block_size - offset_in_block, remain_seq_len)
+                copy_bytes = copy_seq_len * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
+
+                k_cache_base = kv_cache[0, curr_block_table[block_table_i], offset_in_block, 0]
+                v_cache_base = kv_cache[1, curr_block_table[block_table_i], offset_in_block, 0]
+
+                #print(f"kv_cache base ptr: {kv_cache.data_ptr()}")
+                #print(f"k_cache base ptr: {k_cache_base.data_ptr()}")
+
+                #print(f"batch: {batch_i}, copy_bytes: {copy_bytes}, block_id: {curr_block_table[block_table_i]}, offset_in_block: {offset_in_block}")
+
+                # update k_cache
+                ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes, key[flat_seq_offset + curr_seq_offset].data_ptr(), copy_bytes, 3, get_default_stream())
+                assert ret == 0, "failed to copy k cache"
+                ret = acl.rt.memcpy_async(v_cache_base.data_ptr(), copy_bytes, value[flat_seq_offset + curr_seq_offset].data_ptr(), copy_bytes, 3, get_default_stream())
+                assert ret == 0, "failed to copy v cache"
+
+                remain_seq_len -= copy_seq_len
+                block_table_i += 1
+                offset_in_block = (offset_in_block + copy_seq_len) % self.block_size
+                curr_seq_offset += copy_seq_len
+
+
+            curr_seq_len = attn_metadata.seq_lens[batch_i]
+            curr_offset = attn_metadata.offsets[batch_i]
+            curr_seq_block_num = len(curr_block_table)
+            curr_k_cache = torch.empty((curr_seq_block_num, self.block_size, self.hidden_dim), dtype=torch.float16, device="npu")
+            curr_v_cache = torch.empty((curr_seq_block_num, self.block_size, self.hidden_dim), dtype=torch.float16, device="npu")
+
+            curr_pos = curr_offset + curr_seq_len
+
+            for i, block_id in enumerate(curr_block_table):
+                #print(f"i: {i}, block_id: {block_id}, block_bytes: {block_bytes}")
+                #acl.rt.synchronize_stream(get_default_stream())
+                #print(f"k_cache", kv_cache[0, block_id, 0, :].cpu())
+
+                # update k_cache
+                ret = acl.rt.memcpy_async(curr_k_cache[i, ...].data_ptr(), block_bytes, kv_cache[0, block_id, 0, 0].data_ptr(), block_bytes, 3, get_default_stream())
+                assert ret == 0, "failed to copy k cache"
+                ret = acl.rt.memcpy_async(curr_v_cache[i, ...].data_ptr(), block_bytes, kv_cache[1, block_id, 0, 0].data_ptr(), block_bytes, 3, get_default_stream())
+                assert ret == 0, "failed to copy v cache"
+
+            #acl.rt.synchronize_stream(get_default_stream())
+            #print(f"batch: {batch_i} curr_k_cache", curr_k_cache.cpu())
+            #print(f"batch: {batch_i} curr_v_cache", curr_v_cache.cpu())
+
+            q_matmul_k = torch.empty((self.num_heads, curr_pos, curr_seq_len), dtype=torch.float16, device="npu")
+            batch_matmul_qk_trans_causual_layer(get_pointer(q_matmul_k), get_pointer(query[flat_seq_offset]), get_pointer(curr_k_cache),
+                                                self.num_heads, curr_seq_len, curr_pos, self.head_size, curr_offset,
+                                                self.scale, DataType.DT_FLOAT16, get_default_stream())
+            #acl.rt.synchronize_stream(get_default_stream())
+            #print(f"batch: {batch_i} q_matmul_k", q_matmul_k.cpu())
+
+
+            hs = self.num_heads * curr_seq_len
+            softmax_output = torch.empty((hs, curr_pos), dtype=torch.float16, device="npu")
+            softmax_layer(get_pointer(softmax_output), get_pointer(q_matmul_k), hs, curr_pos, DataType.DT_FLOAT16, get_default_stream())
+
+            #acl.rt.synchronize_stream(get_default_stream())
+            #print(f"batch: {batch_i} softmax_output", softmax_output.cpu())
+
+            batch_matmul_trans_v_layer(get_pointer(tmp_output[flat_seq_offset]), get_pointer(softmax_output), get_pointer(curr_v_cache),
+                                       self.num_heads, curr_seq_len, self.head_size, curr_pos, 1.0,
+                                       DataType.DT_FLOAT16, get_default_stream())
+            #acl.rt.synchronize_stream(get_default_stream())
+            #print(f"batch: {batch_i} temp_output", tmp_output[batch_i].cpu())
+            flat_seq_offset += curr_seq_len
+
 
         acl.rt.synchronize_stream(get_default_stream())
         return tmp_output

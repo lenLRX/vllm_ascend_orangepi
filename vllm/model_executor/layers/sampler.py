@@ -236,6 +236,7 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
+        #print(f"logits.shape {logits.shape}")
         _, vocab_size = logits.shape
 
         # Prepare sampling tensors with pinned memory to avoid blocking.

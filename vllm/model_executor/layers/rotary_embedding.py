@@ -681,7 +681,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cos = (freqs.cos() * self.mscale)
         sin = (freqs.sin() * self.mscale)
         cache = torch.cat((cos, sin), dim=-1)
-        print("Cache shape", cache.shape)
+        #print("Cache shape", cache.shape)
         return cache
 
     def forward(
@@ -998,7 +998,9 @@ class NPURotaryEmbedding(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         output_q = torch.empty_like(query)
         output_k = torch.empty_like(key)
+        #print("rope positions: ", positions.cpu())
         if offsets is not None:
+            #print("rope offsets: ", offsets.cpu())
             positions = positions + offsets
         positions = positions.flatten()
         start_pos = positions[0].item()
@@ -1027,7 +1029,7 @@ class NPURotaryEmbedding(torch.nn.Module):
         rope_layer_vllm(get_pointer(output_q), get_pointer(output_k),
                    get_pointer(self.cos_sin_cache),
                    get_pointer(query), get_pointer(key),
-                   start_pos, num_tokens, head_num, hidden_dim, self.is_neox_style,
+                   get_pointer(positions), num_tokens, head_num, hidden_dim, self.is_neox_style,
                    DataType.DT_FLOAT16, get_default_stream())
         return output_q, output_k
 

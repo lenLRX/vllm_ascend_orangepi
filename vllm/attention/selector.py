@@ -12,6 +12,10 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import STR_BACKEND_ENV_VAR
 
+
+if current_platform.is_npu():
+    from vllm.attention.backends.npu_attn import NPUAttnBackend
+
 logger = init_logger(__name__)
 
 
@@ -97,6 +101,8 @@ def get_attn_backend(
     is_attention_free: bool,
     is_blocksparse: bool = False,
 ) -> Type[AttentionBackend]:
+    if current_platform.is_npu():
+        return NPUAttnBackend
     """Selects which attention backend to use and lazily imports it."""
     # Accessing envs.* behind an @lru_cache decorator can cause the wrong
     # value to be returned from the cache if the value changes between calls.

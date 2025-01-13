@@ -119,12 +119,13 @@ def _prune_hidden_states(
     # NOTE(kzawora): The if guard is needed for Gaudi - in some scenarios
     # (warmup, profile_run) we might not have selected_token_indices,
     # so we skip pruning.
+    #print("sampling_metadata.selected_token_indices", sampling_metadata.selected_token_indices)
     if sampling_metadata.selected_token_indices is not None:
         #gather
         assert sampling_metadata.selected_token_indices.dtype ==  torch.int64
         first_dim = sampling_metadata.selected_token_indices.reshape(-1).shape[0]
         last_dim = hidden_states.shape[-1]
-        output = torch.empty((first_dim,) + hidden_states.shape[1:], dtype=hidden_states.dtype, device="npu")
+        output = torch.empty((first_dim, last_dim), dtype=hidden_states.dtype, device="npu")
         gather_layer(get_pointer(output), get_pointer(hidden_states),
                      get_pointer(sampling_metadata.selected_token_indices), 
                      first_dim, last_dim,

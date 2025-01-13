@@ -60,8 +60,9 @@ import acl
 def print_tensor(name, x):
     return
     acl.rt.synchronize_stream(get_default_stream())
-    x = x.cpu()[...,:4, :8]
-    print(name, x)
+    shape = x.shape
+    x = x.cpu()[..., :8]
+    print(name, x, shape)
 
 
 class LlamaMLP(nn.Module):
@@ -353,6 +354,9 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = self.get_input_embeddings(input_ids)
         residual = None
+        #acl.rt.synchronize_stream(get_default_stream())
+        #print("input_ids", input_ids.cpu(), input_ids.shape)
+        print_tensor("input_ids", input_ids)
         print_tensor("emb hidden_states", hidden_states)
 
 

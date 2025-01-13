@@ -79,23 +79,9 @@ class NPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-        #self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-        #                self.parallel_config, self.device_config)
-        model_config = self.model_config
-        head_size = model_config.get_head_size()
-        # Models like Jamba, have mixed typed layers, E.g Mamba
-        num_attention_layers = model_config.get_num_attention_layers(
-            self.parallel_config)
-        num_kv_heads = model_config.get_num_kv_heads(self.parallel_config)
-
-        self.npu_cache = []
-        for _ in range(num_attention_layers):
-            # null block in CpuGpuBlockAllocator requires at least that
-            # block to be zeroed-out.
-            # We zero-out everything for simplicity.
-            self.npu_cache.append(
-                torch.empty((2, model_config.max_model_len, head_size*num_kv_heads),
-                            dtype=model_config.dtype, device="npu"))
+        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
+                        self.parallel_config, self.device_config)
+        self.npu_cache = self.cache_engine.gpu_cache
         self.npu_cache = [self.npu_cache]
 
 

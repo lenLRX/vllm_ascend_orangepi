@@ -61,6 +61,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         first_dim = input_.reshape(-1).shape[0]
         last_dim = layer.weight.shape[-1]
         output = torch.empty(input_.shape + (last_dim,), dtype=layer.weight.dtype, device="npu")
+        #print(f"embedding npu ops input first_dim {first_dim} last_dim {last_dim}")
         #return F.embedding(input_, layer.weight)
         gather_layer(get_pointer(output), get_pointer(layer.weight),
                      get_pointer(input_), first_dim, last_dim,
@@ -495,17 +496,17 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        print("LMHead weight loader")
+        #print("LMHead weight loader")
 
         n, k = loaded_weight.shape
-        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
-        print(f"param shape: {param.shape}")
-        print(f"weight content: {loaded_weight[0]}")
-        print(f"param name {param.name}")
+        #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        #print(f"param shape: {param.shape}")
+        #print(f"weight content: {loaded_weight[0]}")
+        #print(f"param name {param.name}")
         loaded_weight = loaded_weight.npu()
         tranposed_weight = torch.empty_like(loaded_weight)
         n, k = loaded_weight.shape
-        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
         matmul_weight_transpose_layer(get_pointer(tranposed_weight), get_pointer(loaded_weight), 
                                       n, k, DataType.DT_FLOAT16, get_default_stream())
         acl.rt.synchronize_stream(get_default_stream())
