@@ -28,7 +28,7 @@ import torch.nn as nn
 import acl
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, to_npu_dtype, DataType
 from vllm.model_executor.layers.npu.py_npu_ops import rope_layer_vllm
 
 
@@ -1012,6 +1012,8 @@ class NPURotaryEmbedding(torch.nn.Module):
 
         hidden_dim = query.shape[-1]
         head_num = hidden_dim // self.head_size
+        kv_hidden_dim = key.shape[-1]
+        kv_head_num = kv_hidden_dim // self.head_size
         
         #print(f"rope forward is_neox_style {self.is_neox_style} start_pos {start_pos}, num_tokens {num_tokens}")
         #print(f"hidden_dim {hidden_dim}, head_num {head_num}")
@@ -1029,8 +1031,9 @@ class NPURotaryEmbedding(torch.nn.Module):
         rope_layer_vllm(get_pointer(output_q), get_pointer(output_k),
                    get_pointer(self.cos_sin_cache),
                    get_pointer(query), get_pointer(key),
-                   get_pointer(positions), num_tokens, head_num, hidden_dim, self.is_neox_style,
-                   DataType.DT_FLOAT16, get_default_stream())
+                   get_pointer(positions), num_tokens, head_num, kv_head_num,
+                   self.head_size, self.is_neox_style,
+                   to_npu_dtype(query.dtype), get_default_stream())
         return output_q, output_k
 
 

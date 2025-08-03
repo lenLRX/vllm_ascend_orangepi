@@ -793,7 +793,7 @@ def _sample_with_torch(
         sample_metadata[sampling_type] = (seq_group_id, seq_groups)
         long_sample_indices = sample_indices.long()
         if sampling_type == SamplingType.GREEDY:
-            greedy_samples = torch.argmax(logprobs[long_sample_indices],
+            greedy_samples = torch.argmax(logprobs[long_sample_indices.cpu()],
                                           dim=-1)
 
             if sampled_token_ids_tensor is not None:
@@ -828,8 +828,9 @@ def _sample_with_torch(
                         seq_groups_arg,
                     )
             else:
+                # force cpu now
                 multinomial_samples[sampling_type] = _multinomial(
-                    probs[long_sample_indices],
+                    probs[long_sample_indices.cpu()],
                     max_n_in_batch,
                     seq_groups=seq_groups_arg)
 

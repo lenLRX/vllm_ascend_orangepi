@@ -723,7 +723,9 @@ class CacheConfig:
         enable_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
     ) -> None:
-        self.block_size = block_size
+        if block_size != 64:
+            logger.info("cache config block_size: {block_size}, npu page attention force block_size to 64")
+        self.block_size = 64
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * GiB_bytes
         self.num_gpu_blocks_override = num_gpu_blocks_override

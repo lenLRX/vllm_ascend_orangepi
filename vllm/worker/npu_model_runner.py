@@ -122,7 +122,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             logger.warning("Sliding window is not supported on NPU. "
                            "The model will run without sliding window.")
         self.device = self.device_config.device
-        self.pin_memory = is_pin_memory_available()
+        self.pin_memory = False
 
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
@@ -175,8 +175,9 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             input_positions.extend(list(range(seq_len)))
 
             assert seq_group_metadata.block_tables is not None
-            logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
+            #logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
             block_table = seq_group_metadata.block_tables[seq_id]
+            block_table = torch.tensor(block_table, dtype=torch.long).npu()
             input_block_tables.append(block_table)
             #assert len(block_table) == 1
 
@@ -248,6 +249,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 input_lengths.append(1)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
+                block_table = torch.tensor(block_table, dtype=torch.long).npu()
                 input_block_tables.append(block_table)
 
         input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
@@ -297,13 +299,12 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             seq_group_metadata_list,
             seq_lens,
             seq_lens,
-            "cpu", #self.device,
+            self.device,
             self.pin_memory,
             generators=self.get_generators(finished_requests_ids))
         sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.npu()
         attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths,
                                              block_tables=input_block_tables, is_prompt=is_prompt)
-
         return ModelInputForNPU(input_tokens=input_tokens,
                                 input_positions=input_positions,
                                 sampling_metadata=sampling_metadata,

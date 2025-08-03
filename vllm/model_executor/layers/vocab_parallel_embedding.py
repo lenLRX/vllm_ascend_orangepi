@@ -14,7 +14,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
-from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, to_npu_dtype, DataType
 from vllm.model_executor.layers.npu.py_npu_ops import gather_layer, matmul_weight_transpose_layer, matmul_nz_layer
 import acl
 
@@ -49,7 +49,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         #print(f"lm_head forward m: {m} n: {n} k: {k}")
         output = torch.empty(x.shape[:-1] + (n,), dtype=layer.weight.dtype, device="npu")
         matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(layer.weight),
-                        m, n, k, DataType.DT_FLOAT16, get_default_stream())
+                        m, n, k, to_npu_dtype(x.dtype), get_default_stream())
         acl.rt.synchronize_stream(get_default_stream())
         return output
 
@@ -520,6 +520,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         if self.quant_config and self.quant_config.get_name() == "gguf":
             return embed_tokens
         else:
+            # tie weights needs special process
+            assert False
             self.weight = embed_tokens.weight
             return self
 

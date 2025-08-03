@@ -16,10 +16,8 @@ from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata,
                                               AttentionMetadataBuilder,
                                               AttentionState, AttentionType)
-from .util import get_default_stream, get_pointer, DataType
-from .py_npu_ops import (batch_matmul_qk_trans_causual_layer,
-                         softmax_layer,
-                         batch_matmul_trans_v_layer)
+from .util import get_default_stream, get_pointer, to_npu_dtype, DataType, dump_tensor
+from .py_npu_ops import page_attn_gqa_layer
 
 
 class Attention(nn.Module):
@@ -63,6 +61,7 @@ class Attention(nn.Module):
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.group_size = num_heads // num_kv_heads
         self.head_size = head_size
         self.hidden_dim = self.num_heads * self.head_size
         self.scale = scale
@@ -110,9 +109,11 @@ class Attention(nn.Module):
         #print(f"offsets: {attn_metadata.offsets}")
         #print(f"seq_lens: {attn_metadata.seq_lens}")
         #print(f"block_tables: {attn_metadata.block_tables}")
+        #print(f"block_table_type: {type(attn_metadata.block_tables[0])}")
+        #print(f"num_heads {self.num_heads} num_kv_heads {self.num_kv_heads} group_size {self.group_size} head_size {self.head_size}")
         batch_token_num, hidden_dim = query.shape
 
-        tmp_output = torch.empty((batch_token_num, self.hidden_dim), dtype=torch.float16, device="npu")
+        tmp_output = torch.empty((batch_token_num, self.hidden_dim), dtype=query.dtype, device="npu")
         block_bytes = self.block_size * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
 
         batch_size = len(attn_metadata.seq_lens)
@@ -128,6 +129,12 @@ class Attention(nn.Module):
             offset_in_block = curr_offset % self.block_size
             block_table_i = curr_offset // self.block_size
 
+            curr_seq_len = attn_metadata.seq_lens[batch_i]
+            curr_offset = attn_metadata.offsets[batch_i]
+            curr_pos = curr_offset + curr_seq_len
+
+            #print(f"batch_i {batch_i} curr_seq_len {curr_seq_len} curr_offset {curr_offset} curr_pos {curr_pos}")
+
             curr_seq_offset = 0
             while remain_seq_len > 0:
                 copy_seq_len = min(self.block_size - offset_in_block, remain_seq_len)
@@ -138,7 +145,6 @@ class Attention(nn.Module):
 
                 #print(f"kv_cache base ptr: {kv_cache.data_ptr()}")
                 #print(f"k_cache base ptr: {k_cache_base.data_ptr()}")
-
                 #print(f"batch: {batch_i}, copy_bytes: {copy_bytes}, block_id: {curr_block_table[block_table_i]}, offset_in_block: {offset_in_block}")
 
                 # update k_cache
@@ -151,53 +157,19 @@ class Attention(nn.Module):
                 block_table_i += 1
                 offset_in_block = (offset_in_block + copy_seq_len) % self.block_size
                 curr_seq_offset += copy_seq_len
+            page_attn_gqa_layer(get_pointer(tmp_output[flat_seq_offset, ...]),
+                                get_pointer(attn_metadata.block_tables[batch_i]),
+                                get_pointer(query[flat_seq_offset:flat_seq_offset+curr_seq_len, ...]), 
+                                get_pointer(kv_cache[0, ...]),
+                                get_pointer(kv_cache[1, ...]),
+                                curr_seq_len, curr_pos, curr_offset, self.group_size,
+                                self.num_kv_heads, self.head_size, to_npu_dtype(query.dtype), get_default_stream())
 
 
-            curr_seq_len = attn_metadata.seq_lens[batch_i]
-            curr_offset = attn_metadata.offsets[batch_i]
-            curr_seq_block_num = len(curr_block_table)
-            curr_k_cache = torch.empty((curr_seq_block_num, self.block_size, self.hidden_dim), dtype=torch.float16, device="npu")
-            curr_v_cache = torch.empty((curr_seq_block_num, self.block_size, self.hidden_dim), dtype=torch.float16, device="npu")
-
-            curr_pos = curr_offset + curr_seq_len
-
-            for i, block_id in enumerate(curr_block_table):
-                #print(f"i: {i}, block_id: {block_id}, block_bytes: {block_bytes}")
-                #acl.rt.synchronize_stream(get_default_stream())
-                #print(f"k_cache", kv_cache[0, block_id, 0, :].cpu())
-
-                # update k_cache
-                ret = acl.rt.memcpy_async(curr_k_cache[i, ...].data_ptr(), block_bytes, kv_cache[0, block_id, 0, 0].data_ptr(), block_bytes, 3, get_default_stream())
-                assert ret == 0, "failed to copy k cache"
-                ret = acl.rt.memcpy_async(curr_v_cache[i, ...].data_ptr(), block_bytes, kv_cache[1, block_id, 0, 0].data_ptr(), block_bytes, 3, get_default_stream())
-                assert ret == 0, "failed to copy v cache"
-
-            #acl.rt.synchronize_stream(get_default_stream())
-            #print(f"batch: {batch_i} curr_k_cache", curr_k_cache.cpu())
-            #print(f"batch: {batch_i} curr_v_cache", curr_v_cache.cpu())
-
-            q_matmul_k = torch.empty((self.num_heads, curr_pos, curr_seq_len), dtype=torch.float16, device="npu")
-            batch_matmul_qk_trans_causual_layer(get_pointer(q_matmul_k), get_pointer(query[flat_seq_offset]), get_pointer(curr_k_cache),
-                                                self.num_heads, curr_seq_len, curr_pos, self.head_size, curr_offset,
-                                                self.scale, DataType.DT_FLOAT16, get_default_stream())
-            #acl.rt.synchronize_stream(get_default_stream())
-            #print(f"batch: {batch_i} q_matmul_k", q_matmul_k.cpu())
-
-
-            hs = self.num_heads * curr_seq_len
-            softmax_output = torch.empty((hs, curr_pos), dtype=torch.float16, device="npu")
-            softmax_layer(get_pointer(softmax_output), get_pointer(q_matmul_k), hs, curr_pos, DataType.DT_FLOAT16, get_default_stream())
-
-            #acl.rt.synchronize_stream(get_default_stream())
-            #print(f"batch: {batch_i} softmax_output", softmax_output.cpu())
-
-            batch_matmul_trans_v_layer(get_pointer(tmp_output[flat_seq_offset]), get_pointer(softmax_output), get_pointer(curr_v_cache),
-                                       self.num_heads, curr_seq_len, self.head_size, curr_pos, 1.0,
-                                       DataType.DT_FLOAT16, get_default_stream())
-            #acl.rt.synchronize_stream(get_default_stream())
-            #print(f"batch: {batch_i} temp_output", tmp_output[batch_i].cpu())
             flat_seq_offset += curr_seq_len
-
+        #assert query.is_contiguous()
+        #assert kv_cache.is_contiguous()
+        #assert tmp_output.is_contiguous()
 
         acl.rt.synchronize_stream(get_default_stream())
         return tmp_output

@@ -1,7 +1,22 @@
+import os
 import torch
 import torch_npu
 import acl
 from .py_npu_ops import NPUPtr, DataType
+
+
+NPU_DT_MAPPING = {
+    torch.uint8: DataType.DT_UINT8,
+    torch.int8: DataType.DT_INT8,
+    torch.int32: DataType.DT_INT32,
+    torch.float16: DataType.DT_FLOAT16,
+    torch.bfloat16: DataType.DT_BFLOAT16,
+    torch.float32: DataType.DT_FLOAT32,
+    torch.int64: DataType.DT_INT64
+}
+
+def to_npu_dtype(torch_dt):
+    return NPU_DT_MAPPING[torch_dt]
 
 
 def get_default_stream():
@@ -30,5 +45,13 @@ class NPUTimer:
         acl.rt.destroy_event(self.start_event)
         acl.rt.destroy_event(end_event)
 
-
+def dump_tensor(output_path, tensor):
+    vt = tensor
+    if vt.dtype == torch.bfloat16:
+        vt = vt.view(torch.half)
+    np_tensor = vt.cpu().numpy()
+    dump_path = os.path.join("/data/debug", output_path)
+    np_tensor.tofile(dump_path)
+    print(f"dump_tensor to {dump_path}, tensor shape: {tensor.shape} dtype: {tensor.dtype}")
+    
 

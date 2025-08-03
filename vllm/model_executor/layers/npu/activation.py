@@ -1,6 +1,7 @@
 import torch
+import acl
 
-from .util import get_default_stream, get_pointer, DataType
+from .util import get_default_stream, get_pointer, to_npu_dtype, DataType
 from .py_npu_ops import silu_mul_layer_vllm
 
 
@@ -12,15 +13,17 @@ class SiluAndMul:
         #print(f"SiluAndMul input shape {x.shape}")
         output_shape = list(x.shape)
         output_shape[-1] = output_shape[-1] // 2
+
+        #print(f"SiluAndMul input shape {x.shape} output_shape {output_shape}")
+
         last_dim = output_shape[-1]
         assert last_dim % 16 == 0
-        assert x.dtype == torch.float16
         output = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         shape2d = output.reshape(-1, last_dim).shape
         silu_mul_layer_vllm(get_pointer(output), get_pointer(x),
                             shape2d[0], shape2d[1],
-                            DataType.DT_FLOAT16, get_default_stream())
-        
+                            to_npu_dtype(x.dtype), get_default_stream())
+        acl.rt.synchronize_stream(get_default_stream())
         return output
         
 

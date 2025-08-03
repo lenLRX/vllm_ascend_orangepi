@@ -10,8 +10,8 @@ from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 
 from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, DataType, NPUTimer
-from vllm.model_executor.layers.npu.py_npu_ops import matmul_nz_awq_4bit_layer, convert_awq_4bit_qweight
-
+from vllm.model_executor.layers.npu.py_npu_ops import matmul_nz_awq_4bit_layer, matmul_nz_awq_4bit_bias_layer, convert_awq_4bit_qweight
+import acl
 
 
 class AWQConfig(QuantizationConfig):
@@ -205,6 +205,8 @@ class AWQLinearMethod(LinearMethodBase):
                                           requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data,
                                           requires_grad=False)
+        if layer.bias is not None:
+            layer.bias = torch.nn.Parameter(layer.bias.cpu().float().npu(), requires_grad=False)
 
     def apply(self,
               layer: torch.nn.Module,
@@ -217,18 +219,19 @@ class AWQLinearMethod(LinearMethodBase):
         out_shape = (x.shape[:-1] + (qweight.shape[-1] * pack_factor, ))
         reshaped_x = x.reshape(-1, x.shape[-1])
         out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-        #print(f"input shape: {x.shape}, qweight shape: {qweight.shape}, qweight dtype {qweight.dtype}, pack_factor {pack_factor}")
+        #print(f"awq input shape: {x.shape}, qweight shape: {qweight.shape}, qweight dtype {qweight.dtype}, pack_factor {pack_factor}")
         k, n = qweight.shape
         n *= pack_factor
         m, k = x.reshape(-1, k).shape
 
         assert m < 4096
 
-        #with NPUTimer(get_default_stream()) as timer:
-        if True:
+        if bias is not None:
+            matmul_nz_awq_4bit_bias_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
+                                          get_pointer(bias),  m, n, k, DataType.DT_FLOAT16, get_default_stream())
+        else:
             matmul_nz_awq_4bit_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
                                      m, n, k, DataType.DT_FLOAT16, get_default_stream())
         #print(f"awq 4bit matmul m: {m} n: {n} k: {k} duration: {timer.duration:.4f} ms")
-        if bias is not None:
-            out.add_(bias)
+        acl.rt.synchronize_stream(get_default_stream())
         return out.reshape(out_shape)

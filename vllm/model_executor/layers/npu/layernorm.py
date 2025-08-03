@@ -4,7 +4,7 @@ import acl
 import torch
 import torch.nn as nn
 
-from .util import get_default_stream, get_pointer, DataType
+from .util import get_default_stream, get_pointer, to_npu_dtype, DataType
 from .py_npu_ops import rmsnorm_layer, add_layer
 
 
@@ -38,11 +38,8 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
             add_out = torch.empty_like(x)
             add_layer(get_pointer(add_out), get_pointer(x), get_pointer(residual),
-                      x.numel(), DataType.DT_FLOAT16, get_default_stream())
+                      x.numel(), to_npu_dtype(x.dtype), get_default_stream())
             residual = add_out
-
-
-        assert x.dtype == torch.float16
 
         hidden_size = x.shape[-1]
         assert hidden_size % 16 == 0
@@ -57,7 +54,7 @@ class RMSNorm(torch.nn.Module):
         output = torch.empty_like(x)
         rmsnorm_layer(get_pointer(output), get_pointer(self.weight),
                       get_pointer(x if residual is None else add_out), first_dim, hidden_size, self.variance_epsilon,
-                      DataType.DT_FLOAT16, get_default_stream())
+                      to_npu_dtype(x.dtype), get_default_stream())
 
         acl.rt.synchronize_stream(get_default_stream())
         if residual is None:

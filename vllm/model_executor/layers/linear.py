@@ -19,6 +19,11 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PerTensorScaleParameter,
                                            RowvLLMParameter)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, to_npu_dtype, DataType
+from vllm.model_executor.layers.npu.py_npu_ops import (matmul_nz_layer, 
+                                                       matmul_bias_nz_layer,
+                                                       matmul_weight_transpose_layer)
+import acl
 
 logger = init_logger(__name__)
 
@@ -127,12 +132,52 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        #print(f"layer {layer}")
+        #print(f"layer weight device {layer.weight.device} shape {layer.weight.shape} dtype {layer.weight.dtype}")
+
+        new_weight = torch.empty_like(layer.weight)
+        #print(f"new_weight shape {new_weight.shape}")
+
+        n, k = layer.weight.shape
+
+        matmul_weight_transpose_layer(get_pointer(new_weight), get_pointer(layer.weight),
+                                      n, k, DataType.DT_FLOAT16, # we dont care dtype here
+                                      get_default_stream())
+
+        if layer.bias is not None:
+            #print(f"layer bias shape {layer.bias.shape} dtype {layer.bias.dtype}")
+            layer.bias = torch.nn.Parameter(layer.bias.float(), requires_grad=False)
+        acl.rt.synchronize_stream(get_default_stream())
+        layer.weight = torch.nn.Parameter(new_weight, requires_grad=False)
+
+
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        m, k = x.shape
+        n, k = layer.weight.shape
 
-        return F.linear(x, layer.weight, bias)
+        #print(f"UnquantizedLinearMethod m {m} n {n} k {k}  x shape {x.shape} x dtype {x.dtype} bias is None {bias is None}")
+
+        output = torch.empty((m, n), dtype=x.dtype, device=x.device)
+
+        if layer.bias is not None:
+            matmul_bias_nz_layer(get_pointer(output),
+                                 get_pointer(x),
+                                 get_pointer(layer.weight),
+                                 get_pointer(layer.bias),
+                                 m, n, k, to_npu_dtype(x.dtype),
+                                 get_default_stream())
+        else:
+            matmul_nz_layer(get_pointer(output),
+                                 get_pointer(x),
+                                 get_pointer(layer.weight),
+                                 m, n, k, to_npu_dtype(x.dtype),
+                                 get_default_stream())
+        return output
+
 
 
 class LinearBase(torch.nn.Module):
