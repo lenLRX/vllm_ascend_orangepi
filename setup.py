@@ -445,7 +445,7 @@ if _build_custom_ops():
 
 package_data = {
     "vllm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json",
-             "vllm/model_executor/layers/npu/*.so"]
+             "model_executor/layers/npu/*.so"]
 }
 if envs.VLLM_USE_PRECOMPILED:
     ext_modules = []
