@@ -1,3 +1,51 @@
+# VLLM适配OrangePi
+## 安装方式
+[Release页面](https://github.com/lenLRX/vllm_ascend_orangepi/releases)下载wheel直接在香橙派上pip安装
+## 使用方式
+### 下载模型
+vllm支持自动下载huggingface和modelscope的模型,默认使用huggingface可以通过环境变量改为modelscope
+```
+export VLLM_USE_MODELSCOPE=True
+```
+一般来说SD卡容量小，而且慢。建议通过环境变量将默认存储位置改为加装的固态硬盘。
+```
+export HF_HOME=/ssd/hf_home
+export MODELSCOPE_CACHE=/ssd/hf_home
+```
+vllm也支持使用本地已经下载好的模型，直接设置绝对路径即可
+
+### OpenAI http api
+```bash
+# 自动下载模型
+python -m vllm.entrypoints.openai.api_server --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+# 使用本地已下载模型
+python -m vllm.entrypoints.openai.api_server --model /ssd/models/Qwen2.5-7B-Instruct-AWQ/
+```
+### python脚本
+```python
+from vllm import LLM, SamplingParams
+
+sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=16, seed=42)
+llm = LLM(model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+
+prompts = [
+    "AI的未来是",
+    "The weather today"
+]
+
+outputs = llm.generate(prompts, sampling_params)
+
+for i, output in enumerate(outputs):
+    print(f"Prompt {i+1}: {prompts[i]}")
+    print(f"Generated: {output.outputs[0].text}\n")
+```
+### CherryStudio对接
+
+<img width="1612" height="894" alt="image" src="https://github.com/user-attachments/assets/36796bb9-ddbc-4f9c-960e-a3cc071b730e" />
+如果使用本地模型，"模型ID"填启动命令行的--model参数中给的路径
+
+
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/source/assets/logos/vllm-logo-text-dark.png">
