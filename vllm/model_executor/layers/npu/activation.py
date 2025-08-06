@@ -23,7 +23,6 @@ class SiluAndMul:
         silu_mul_layer_vllm(get_pointer(output), get_pointer(x),
                             shape2d[0], shape2d[1],
                             to_npu_dtype(x.dtype), get_default_stream())
-        acl.rt.synchronize_stream(get_default_stream())
         return output
         
 

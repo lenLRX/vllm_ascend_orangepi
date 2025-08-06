@@ -125,7 +125,7 @@ class Attention(nn.Module):
             curr_seq_len = attn_metadata.seq_lens[batch_i]
             curr_offset = attn_metadata.offsets[batch_i]
             remain_seq_len = curr_seq_len
-            curr_block_table = attn_metadata.block_tables[batch_i]
+            curr_block_table_npu, curr_block_table_host  = attn_metadata.block_tables[batch_i]
             offset_in_block = curr_offset % self.block_size
             block_table_i = curr_offset // self.block_size
 
@@ -140,8 +140,8 @@ class Attention(nn.Module):
                 copy_seq_len = min(self.block_size - offset_in_block, remain_seq_len)
                 copy_bytes = copy_seq_len * kv_cache.dtype.itemsize * self.num_kv_heads * self.head_size
 
-                k_cache_base = kv_cache[0, curr_block_table[block_table_i], offset_in_block, 0]
-                v_cache_base = kv_cache[1, curr_block_table[block_table_i], offset_in_block, 0]
+                k_cache_base = kv_cache[0, curr_block_table_host[block_table_i], offset_in_block, 0]
+                v_cache_base = kv_cache[1, curr_block_table_host[block_table_i], offset_in_block, 0]
 
                 #print(f"kv_cache base ptr: {kv_cache.data_ptr()}")
                 #print(f"k_cache base ptr: {k_cache_base.data_ptr()}")
@@ -158,7 +158,7 @@ class Attention(nn.Module):
                 offset_in_block = (offset_in_block + copy_seq_len) % self.block_size
                 curr_seq_offset += copy_seq_len
             page_attn_gqa_layer(get_pointer(tmp_output[flat_seq_offset, ...]),
-                                get_pointer(attn_metadata.block_tables[batch_i]),
+                                get_pointer(curr_block_table_npu),
                                 get_pointer(query[flat_seq_offset:flat_seq_offset+curr_seq_len, ...]), 
                                 get_pointer(kv_cache[0, ...]),
                                 get_pointer(kv_cache[1, ...]),
@@ -171,7 +171,6 @@ class Attention(nn.Module):
         #assert kv_cache.is_contiguous()
         #assert tmp_output.is_contiguous()
 
-        acl.rt.synchronize_stream(get_default_stream())
         return tmp_output
 
 

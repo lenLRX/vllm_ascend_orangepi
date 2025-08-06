@@ -224,7 +224,7 @@ class AWQLinearMethod(LinearMethodBase):
         n *= pack_factor
         m, k = x.reshape(-1, k).shape
 
-        assert m < 4096
+        #assert m < 4096
 
         if bias is not None:
             matmul_nz_awq_4bit_bias_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
@@ -233,5 +233,4 @@ class AWQLinearMethod(LinearMethodBase):
             matmul_nz_awq_4bit_layer(get_pointer(out), get_pointer(reshaped_x), get_pointer(qweight), get_pointer(qzeros), get_pointer(scales),
                                      m, n, k, DataType.DT_FLOAT16, get_default_stream())
         #print(f"awq 4bit matmul m: {m} n: {n} k: {k} duration: {timer.duration:.4f} ms")
-        acl.rt.synchronize_stream(get_default_stream())
         return out.reshape(out_shape)

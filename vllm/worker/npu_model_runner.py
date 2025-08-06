@@ -177,8 +177,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             assert seq_group_metadata.block_tables is not None
             #logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
             block_table = seq_group_metadata.block_tables[seq_id]
-            block_table = torch.tensor(block_table, dtype=torch.long).npu()
-            input_block_tables.append(block_table)
+            block_table_tup = (torch.tensor(block_table, dtype=torch.long).npu(), block_table)
+            input_block_tables.append(block_table_tup)
             #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
@@ -249,8 +249,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 input_lengths.append(1)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
-                block_table = torch.tensor(block_table, dtype=torch.long).npu()
-                input_block_tables.append(block_table)
+                block_table_tup = (torch.tensor(block_table, dtype=torch.long).npu(), block_table)
+                input_block_tables.append(block_table_tup)
 
         input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
         input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)

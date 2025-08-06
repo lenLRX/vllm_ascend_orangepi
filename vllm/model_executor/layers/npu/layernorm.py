@@ -56,7 +56,6 @@ class RMSNorm(torch.nn.Module):
                       get_pointer(x if residual is None else add_out), first_dim, hidden_size, self.variance_epsilon,
                       to_npu_dtype(x.dtype), get_default_stream())
 
-        acl.rt.synchronize_stream(get_default_stream())
         if residual is None:
             return output
         else:

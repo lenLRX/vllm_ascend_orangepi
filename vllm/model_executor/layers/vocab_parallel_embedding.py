@@ -50,7 +50,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         output = torch.empty(x.shape[:-1] + (n,), dtype=layer.weight.dtype, device="npu")
         matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(layer.weight),
                         m, n, k, to_npu_dtype(x.dtype), get_default_stream())
-        acl.rt.synchronize_stream(get_default_stream())
         return output
 
 

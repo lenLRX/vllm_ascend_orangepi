@@ -393,44 +393,7 @@ def get_vllm_version() -> str:
 
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
-    if _no_device():
-        if envs.VLLM_TARGET_DEVICE == "empty":
-            version += f"{sep}empty"
-    elif _is_cuda():
-        cuda_version = str(get_nvcc_cuda_version())
-        if cuda_version != MAIN_CUDA_VERSION:
-            cuda_version_str = cuda_version.replace(".", "")[:3]
-            # skip this for source tarball, required for pypi
-            if "sdist" not in sys.argv:
-                version += f"{sep}cu{cuda_version_str}"
-    elif _is_hip():
-        # Get the HIP version
-        hipcc_version = get_hipcc_rocm_version()
-        if hipcc_version != MAIN_CUDA_VERSION:
-            rocm_version_str = hipcc_version.replace(".", "")[:3]
-            version += f"{sep}rocm{rocm_version_str}"
-    elif _is_neuron():
-        # Get the Neuron version
-        neuron_version = str(get_neuronxcc_version())
-        if neuron_version != MAIN_CUDA_VERSION:
-            neuron_version_str = neuron_version.replace(".", "")[:3]
-            version += f"{sep}neuron{neuron_version_str}"
-    elif _is_hpu():
-        # Get the Intel Gaudi Software Suite version
-        gaudi_sw_version = str(get_gaudi_sw_version())
-        if gaudi_sw_version != MAIN_CUDA_VERSION:
-            gaudi_sw_version = gaudi_sw_version.replace(".", "")[:3]
-            version += f"{sep}gaudi{gaudi_sw_version}"
-    elif _is_openvino():
-        version += f"{sep}openvino"
-    elif _is_tpu():
-        version += f"{sep}tpu"
-    elif _is_cpu():
-        version += f"{sep}cpu"
-    elif _is_xpu():
-        version += f"{sep}xpu"
-    else:
-        raise RuntimeError("Unknown runtime environment")
+    version += f"{sep}npu"
 
     return version
 
@@ -461,38 +424,7 @@ def get_requirements() -> List[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    if _no_device():
-        requirements = _read_requirements("requirements-cuda.txt")
-    elif _is_cuda():
-        requirements = _read_requirements("requirements-cuda.txt")
-        cuda_major, cuda_minor = torch.version.cuda.split(".")
-        modified_requirements = []
-        for req in requirements:
-            if ("vllm-flash-attn" in req
-                    and not (cuda_major == "12" and cuda_minor == "1")):
-                # vllm-flash-attn is built only for CUDA 12.1.
-                # Skip for other versions.
-                continue
-            modified_requirements.append(req)
-        requirements = modified_requirements
-    elif _is_hip():
-        requirements = _read_requirements("requirements-rocm.txt")
-    elif _is_neuron():
-        requirements = _read_requirements("requirements-neuron.txt")
-    elif _is_hpu():
-        requirements = _read_requirements("requirements-hpu.txt")
-    elif _is_openvino():
-        requirements = _read_requirements("requirements-openvino.txt")
-    elif _is_tpu():
-        requirements = _read_requirements("requirements-tpu.txt")
-    elif _is_cpu():
-        requirements = _read_requirements("requirements-cpu.txt")
-    elif _is_xpu():
-        requirements = _read_requirements("requirements-xpu.txt")
-    else:
-        raise ValueError(
-            "Unsupported platform, please use CUDA, ROCm, Neuron, HPU, "
-            "OpenVINO, or CPU.")
+    requirements = _read_requirements("requirements-common.txt")
     return requirements
 
 
@@ -512,7 +444,8 @@ if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
 
 package_data = {
-    "vllm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json"]
+    "vllm": ["py.typed", "model_executor/layers/fused_moe/configs/*.json",
+             "vllm/model_executor/layers/npu/*.so"]
 }
 if envs.VLLM_USE_PRECOMPILED:
     ext_modules = []

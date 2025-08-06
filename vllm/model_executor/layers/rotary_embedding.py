@@ -998,12 +998,9 @@ class NPURotaryEmbedding(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         output_q = torch.empty_like(query)
         output_k = torch.empty_like(key)
-        #print("rope positions: ", positions.cpu())
         if offsets is not None:
-            #print("rope offsets: ", offsets.cpu())
             positions = positions + offsets
         positions = positions.flatten()
-        start_pos = positions[0].item()
         num_tokens = positions.shape[0]
 
         #print(f"query shape {query.shape} stride {query.stride()}")
@@ -1015,7 +1012,6 @@ class NPURotaryEmbedding(torch.nn.Module):
         kv_hidden_dim = key.shape[-1]
         kv_head_num = kv_hidden_dim // self.head_size
         
-        #print(f"rope forward is_neox_style {self.is_neox_style} start_pos {start_pos}, num_tokens {num_tokens}")
         #print(f"hidden_dim {hidden_dim}, head_num {head_num}")
         #print("cache", self.cos_sin_cache.cpu().reshape(-1)[:8])
         #print("cache", self.cos_sin_cache.cpu().reshape(-1)[64:64+8])
