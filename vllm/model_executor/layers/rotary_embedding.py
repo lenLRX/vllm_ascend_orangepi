@@ -28,7 +28,11 @@ import torch.nn as nn
 import acl
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, to_npu_dtype, DataType
+from vllm.model_executor.layers.npu.util import (get_default_stream,
+                                                 get_pointer,
+                                                 to_npu_dtype,
+                                                 DataType,
+                                                 MSTX)
 from vllm.model_executor.layers.npu.py_npu_ops import rope_layer_vllm
 
 

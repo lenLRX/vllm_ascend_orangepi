@@ -26,6 +26,23 @@ def get_default_stream():
 def get_pointer(x):
     return NPUPtr(x.data_ptr())
 
+
+class MSTX:
+
+    def __init__(self, msg):
+        self.stamp = acl.prof.create_stamp()
+        self.msg = msg
+
+    def __enter__(self):
+        acl.prof.set_stamp_trace_message(self.stamp, self.msg, len(self.msg))
+        acl.prof.push(self.stamp)
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        acl.prof.pop(self.stamp)
+        acl.prof.destroy_stamp(self.stamp)
+
+
+
 class NPUTimer:
 
     def __init__(self, stream):

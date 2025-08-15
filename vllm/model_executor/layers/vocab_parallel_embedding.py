@@ -43,12 +43,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         assert bias is None
-        n, k = layer.weight.shape
+        n, k = self.transposed_weight.shape
         m = x.reshape(-1, k).shape[0]
 
-        #print(f"lm_head forward m: {m} n: {n} k: {k}")
-        output = torch.empty(x.shape[:-1] + (n,), dtype=layer.weight.dtype, device="npu")
-        matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(layer.weight),
+        #print(f"lm_head embedding forward m: {m} n: {n} k: {k}")
+        output = torch.empty(x.shape[:-1] + (n,), dtype=self.transposed_weight.dtype, device="npu")
+        matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(self.transposed_weight),
                         m, n, k, to_npu_dtype(x.dtype), get_default_stream())
         return output
 
@@ -67,6 +67,13 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
                      DataType.DT_INT64, DataType.DT_FLOAT16, get_default_stream())
         return output
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        self.transposed_weight = torch.empty_like(layer.weight, device="npu")
+        n, k = layer.weight.shape
+        #print(f"loaded weight shape: {layer.weight.shape} device {layer.weight.device}")
+        matmul_weight_transpose_layer(get_pointer(self.transposed_weight), get_pointer(layer.weight), 
+                                      n, k, DataType.DT_FLOAT16, get_default_stream())
+        acl.rt.synchronize_stream(get_default_stream())
 
 def pad_vocab_size(vocab_size: int,
                    pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
@@ -289,6 +296,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                                           params_dtype=params_dtype,
                                           weight_loader=self.weight_loader)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        assert False
+
     @classmethod
     def _get_indices(cls, vocab_size_padded: int, org_vocab_size_padded: int,
                      vocab_size: int, org_vocab_size: int, tp_rank: int,
@@ -409,7 +419,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
         if current_platform.is_npu():
-            param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+            #param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+            param.data = loaded_weight
         elif current_platform.is_hpu():
             # FIXME(kzawora): Weight copy with slicing bugs out on Gaudi here,
             # so we're using a workaround. Remove this when fixed in
@@ -435,9 +446,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.shard_indices.added_vocab_end_index)
         else:
             masked_input = input_
+        assert masked_input.dtype == torch.long
         # Get the embeddings.
         output_parallel = self.linear_method.embedding(self,
-                                                       masked_input.long())
+                                                       masked_input)
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
@@ -495,17 +507,17 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        #print("LMHead weight loader")
+        print("LMHead weight loader")
 
         n, k = loaded_weight.shape
         #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
         #print(f"param shape: {param.shape}")
         #print(f"weight content: {loaded_weight[0]}")
-        #print(f"param name {param.name}")
+        print(f"param name {param.name}")
         loaded_weight = loaded_weight.npu()
         tranposed_weight = torch.empty_like(loaded_weight)
         n, k = loaded_weight.shape
-        #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
         matmul_weight_transpose_layer(get_pointer(tranposed_weight), get_pointer(loaded_weight), 
                                       n, k, DataType.DT_FLOAT16, get_default_stream())
         acl.rt.synchronize_stream(get_default_stream())

@@ -461,6 +461,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
+            self.lm_head.quant_method = self.model.embed_tokens.linear_method
         else:
             self.lm_head = ParallelLMHead(config.vocab_size,
                                           config.hidden_size,
