@@ -43,12 +43,13 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         assert bias is None
-        n, k = self.transposed_weight.shape
+        weight = getattr(self, "transposed_weight", layer.weight)
+        n, k = weight.shape
         m = x.reshape(-1, k).shape[0]
 
         #print(f"lm_head embedding forward m: {m} n: {n} k: {k}")
-        output = torch.empty(x.shape[:-1] + (n,), dtype=self.transposed_weight.dtype, device="npu")
-        matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(self.transposed_weight),
+        output = torch.empty(x.shape[:-1] + (n,), dtype=weight.dtype, device="npu")
+        matmul_nz_layer(get_pointer(output), get_pointer(x), get_pointer(weight),
                         m, n, k, to_npu_dtype(x.dtype), get_default_stream())
         return output
 
@@ -507,23 +508,24 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        print("LMHead weight loader")
+        #print("LMHead weight loader")
 
         n, k = loaded_weight.shape
         #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
         #print(f"param shape: {param.shape}")
         #print(f"weight content: {loaded_weight[0]}")
-        print(f"param name {param.name}")
+        #print(f"param name {param.name}")
         loaded_weight = loaded_weight.npu()
         tranposed_weight = torch.empty_like(loaded_weight)
         n, k = loaded_weight.shape
-        print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
+        #print(f"loaded weight shape: {loaded_weight.shape} device {loaded_weight.device}")
         matmul_weight_transpose_layer(get_pointer(tranposed_weight), get_pointer(loaded_weight), 
                                       n, k, DataType.DT_FLOAT16, get_default_stream())
         acl.rt.synchronize_stream(get_default_stream())
+        # TODO: remove this copy
         loaded_weight = tranposed_weight.cpu()
-
         param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
+        #param.data = loaded_weight
 
     def tie_weights(self, embed_tokens: VocabParallelEmbedding):
         """Tie the weights with word embeddings."""
