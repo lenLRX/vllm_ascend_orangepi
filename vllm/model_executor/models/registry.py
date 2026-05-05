@@ -82,6 +82,8 @@ _TEXT_GENERATION_MODELS = {
     "Phi3SmallForCausalLM": ("phi3_small", "Phi3SmallForCausalLM"),
     "PhiMoEForCausalLM": ("phimoe", "PhiMoEForCausalLM"),
     # QWenLMHeadModel supports multimodal
+    "Gemma4ForConditionalGeneration": ("gemma4_npu", "Gemma4ForCausalLM"),
+    "Gemma4ForCausalLM": ("gemma4_npu", "Gemma4ForCausalLM"),
     "Qwen2ForCausalLM": ("qwen2_npu", "Qwen2ForCausalLM"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),

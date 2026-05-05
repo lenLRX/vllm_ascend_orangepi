@@ -2,6 +2,7 @@ from vllm.transformers_utils.configs.chatglm import ChatGLMConfig
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
 from vllm.transformers_utils.configs.exaone import ExaoneConfig
+from vllm.transformers_utils.configs.gemma4 import Gemma4Config, Gemma4TextConfig
 # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
 # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
 # `FalconConfig` class from the official HuggingFace transformers library.
@@ -35,4 +36,6 @@ __all__ = [
     "NVLM_D_Config",
     "SolarConfig",
     "UltravoxConfig",
+    "Gemma4Config",
+    "Gemma4TextConfig",
 ]

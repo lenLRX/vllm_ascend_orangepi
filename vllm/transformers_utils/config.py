@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 # yapf: disable
 from vllm.transformers_utils.configs import (ChatGLMConfig, DbrxConfig,
                                              EAGLEConfig, ExaoneConfig,
+                                             Gemma4Config, Gemma4TextConfig,
                                              H2OVLChatConfig,
                                              InternVLChatConfig, JAISConfig,
                                              MedusaConfig, MllamaConfig,
@@ -62,6 +63,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     "NVLM_D": NVLM_D_Config,
     "solar": SolarConfig,
     "ultravox": UltravoxConfig,
+    "gemma4": Gemma4Config,
+    "gemma4_text": Gemma4TextConfig,
     **_CONFIG_REGISTRY_OVERRIDE_HF
 }
 
