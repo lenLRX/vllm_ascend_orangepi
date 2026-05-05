@@ -335,12 +335,18 @@ class Gemma4Attention(nn.Module):
             k_out = k_flat
             v_out = v_reshaped.reshape(token_num, self.kv_size)
 
-        # Page attention with KV cache update
+        # Page attention with KV cache update.
+        # The dim256/dim512 kernels use n_tile=16 but vllm block_size=64.
+        # Expand page table: each vllm block becomes 4 kernel entries
+        # page_table_kernel[b*4 + c] = b * 4 + c (sequential K/V cache offsets)
+        block_size = self.attn.block_size
+        kernel_n_tile = 16
+        chunk_per_block = block_size // kernel_n_tile  # 64 // 16 = 4
+
         attn_output = torch.empty(q.shape, dtype=q.dtype, device="npu")
 
         flat_seq_offset = 0
         batch_size = len(attn_metadata.seq_lens)
-        block_size = self.attn.block_size
         for batch_i in range(batch_size):
             curr_seq_len = attn_metadata.seq_lens[batch_i]
             curr_offset = attn_metadata.offsets[batch_i]
@@ -372,13 +378,21 @@ class Gemma4Attention(nn.Module):
                 offset_in_block = (offset_in_block + copy_seq_len) % block_size
                 curr_seq_offset += copy_seq_len
 
-            # Gemma4 uses attention scale = 1.0 (Q/K norms handle scaling)
+            # Expand page table: each 16-token chunk gets a unique sequential offset
+            num_kernel_entries = (curr_pos + kernel_n_tile - 1) // kernel_n_tile
+            expanded_table = []
+            for b in curr_block_table_host:
+                for c in range(chunk_per_block):
+                    expanded_table.append(b * chunk_per_block + c)
+            expanded_table = expanded_table[:num_kernel_entries]
+            expanded_table_npu = torch.tensor(expanded_table, dtype=torch.long, device="npu")
+
             qk_scale = 1.0
 
             if self.is_sliding:
                 page_attn_dim256_gqa_layer(
                     get_pointer(attn_output[flat_seq_offset, ...]),
-                    get_pointer(curr_block_table_npu),
+                    get_pointer(expanded_table_npu),
                     get_pointer(q[flat_seq_offset:flat_seq_offset + curr_seq_len, ...]),
                     get_pointer(kv_cache[0, ...]),
                     get_pointer(kv_cache[1, ...]),
@@ -390,7 +404,7 @@ class Gemma4Attention(nn.Module):
                 group_size = self.num_heads // self.num_kv_heads
                 page_attn_gqa_dim512_layer(
                     get_pointer(attn_output[flat_seq_offset, ...]),
-                    get_pointer(curr_block_table_npu),
+                    get_pointer(expanded_table_npu),
                     get_pointer(q[flat_seq_offset:flat_seq_offset + curr_seq_len, ...]),
                     get_pointer(kv_cache[0, ...]),
                     get_pointer(kv_cache[1, ...]),
