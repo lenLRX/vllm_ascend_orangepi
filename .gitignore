@@ -205,3 +205,4 @@ benchmarks/*.json
 # Linting
 actionlint
 shellcheck*/
+fusion_result.json

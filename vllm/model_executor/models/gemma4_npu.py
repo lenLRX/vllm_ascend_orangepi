@@ -32,7 +32,7 @@ from vllm.model_executor.layers.npu.py_npu_ops import (
     split_qkv_layer, gated_gelu_layer,
     qkv_norm_with_weight_layer, qkv_norm_no_weight_layer,
     page_attn_gqa_dim512_layer, page_attn_dim256_gqa_layer,
-    rope_layer,
+    rope_standard_layer,
     add_layer, rmsnorm_layer, gelu_pytorch_tanh_layer, mul_scalar_layer,
     mul_layer)
 
@@ -236,7 +236,7 @@ class Gemma4Attention(nn.Module):
         rotary_dim = (rotary_dim // 2) * 2  # must be even
         num_freqs = rotary_dim // 2
 
-        freqs = 1.0 / (theta ** (np.arange(0, num_freqs, dtype=np.float64) / rotary_dim))
+        freqs = 1.0 / (theta ** (np.arange(0, 2 * num_freqs, 2, dtype=np.float64) / head_dim))
         positions = np.arange(max_pos, dtype=np.float64)
         freqs = np.outer(positions, freqs)
         freqs_cos = np.cos(freqs).astype(np.float32)
@@ -251,10 +251,10 @@ class Gemma4Attention(nn.Module):
             result_np[:, 2*f+1] = freqs_sin[:, f]
         # Beyond rotary_dim: already 1.0 (cos) and 0.0 (sin) — identity.
 
-        result = torch.from_numpy(result_np.copy())
-        if torch.npu.is_available():
-            result = result.npu()
-        return result
+        # Return CPU tensor; model.npu() will move it later.
+        # Moving to NPU here corrupts the buffer because register_buffer
+        # stores it, then model.npu() tries to move it again.
+        return torch.from_numpy(result_np.copy())
 
     def forward(
         self,
@@ -309,23 +309,24 @@ class Gemma4Attention(nn.Module):
                 self.config.rms_norm_eps,
                 to_npu_dtype(hidden_states.dtype), get_default_stream())
 
-        # Apply RoPE using npu_rope_standard_layer (matching C++ engine).
-        # Takes raw freqs_cis table + start_pos; no pre-gather needed.
+        # Apply RoPE using rope_standard_layer (single-tensor kernel).
+        # Must process Q and K separately since they have different hidden_dim
+        # (rope_layer kernel uses same hidden_dim for both, causing OOB on K).
         start_pos = int(positions[0].item())
         q_flat = q_normed.reshape(token_num, self.q_size)
         k_flat = (k_normed if not self.is_kv_shared_layer else k_reshaped).reshape(token_num, self.kv_size)
 
         q_roped_flat = torch.empty(token_num, self.q_size, dtype=q_flat.dtype, device="npu")
-        rope_layer(get_pointer(q_roped_flat), get_pointer(q_roped_flat),
-                   get_pointer(self.freqs_cis), get_pointer(q_flat), get_pointer(q_flat),
-                   start_pos, token_num, self.num_heads, self.q_size, False,
+        rope_standard_layer(get_pointer(q_roped_flat),
+                   get_pointer(self.freqs_cis), get_pointer(q_flat),
+                   start_pos, token_num, self.num_heads, self.q_size,
                    to_npu_dtype(hidden_states.dtype), get_default_stream())
 
         if not self.is_kv_shared_layer:
             k_roped_flat = torch.empty(token_num, self.kv_size, dtype=k_flat.dtype, device="npu")
-            rope_layer(get_pointer(k_roped_flat), get_pointer(k_roped_flat),
-                       get_pointer(self.freqs_cis), get_pointer(k_flat), get_pointer(k_flat),
-                       start_pos, token_num, self.num_kv_heads, self.kv_size, False,
+            rope_standard_layer(get_pointer(k_roped_flat),
+                       get_pointer(self.freqs_cis), get_pointer(k_flat),
+                       start_pos, token_num, self.num_kv_heads, self.kv_size,
                        to_npu_dtype(hidden_states.dtype), get_default_stream())
             q = q_roped_flat
             k_out = k_roped_flat
