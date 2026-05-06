@@ -110,11 +110,16 @@ class Gemma4MLP(nn.Module):
         last_dim = gate_up.shape[-1] // 2
         output_shape = list(gate_up.shape)
         output_shape[-1] = last_dim
+        # gated_gelu kernel expects [all_gates, all_ups] layout per call.
+        # Call per-token (same as C++ engine) to avoid layout mismatch.
+        # Each token has gate=[0:last_dim], up=[last_dim:2*last_dim].
         output = torch.empty(output_shape, dtype=gate_up.dtype, device=gate_up.device)
-        total_size = output.reshape(-1, last_dim).shape[0] * last_dim
-        gated_gelu_layer(get_pointer(output), get_pointer(gate_up),
-                         total_size, to_npu_dtype(gate_up.dtype),
-                         get_default_stream())
+        flat_in = gate_up.reshape(-1, last_dim * 2)
+        flat_out = output.reshape(-1, last_dim)
+        for t in range(flat_in.shape[0]):
+            gated_gelu_layer(get_pointer(flat_out[t]), get_pointer(flat_in[t]),
+                             last_dim, to_npu_dtype(gate_up.dtype),
+                             get_default_stream())
         x, _ = self.down_proj(output)
         return x
 
