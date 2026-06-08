@@ -248,14 +248,14 @@ class Gemma4Attention(nn.Module):
         freqs_sin = np.sin(freqs).astype(np.float32)
 
         # Build table: cos/sin interleaved. Rotated dims get actual values,
-        # non-rotated dims get cos=1, sin=0
-        result_np = np.ones((max_pos, head_dim), dtype=np.float32)
+        # non-rotated dims get cos=1, sin=0 (identity rotation)
+        result_np = np.zeros((max_pos, head_dim), dtype=np.float32)
+        result_np[:, 0::2] = 1.0  # cos=1 for all positions (rotated dims will be overwritten)
+        # sin=0 already set by np.zeros for all positions
         # Place cos at even indices, sin at odd indices for rotated pairs
         for f in range(num_freqs):
             result_np[:, 2*f] = freqs_cos[:, f]
             result_np[:, 2*f+1] = freqs_sin[:, f]
-        # Beyond rotary_dim: already 1.0 (cos) and 0.0 (sin) — identity.
-
         # Return CPU tensor; model.npu() will move it later.
         # Moving to NPU here corrupts the buffer because register_buffer
         # stores it, then model.npu() tries to move it again.
@@ -314,40 +314,61 @@ class Gemma4Attention(nn.Module):
                 self.config.rms_norm_eps,
                 to_npu_dtype(hidden_states.dtype), get_default_stream())
 
-        # Apply RoPE using rope_standard_layer (single-tensor kernel).
-        # Must process Q and K separately since they have different hidden_dim
-        # (rope_layer kernel uses same hidden_dim for both, causing OOB on K).
-        start_pos = int(positions[0].item())
+        # Apply RoPE per batch item — each sequence may have a different
+        # starting position (e.g. decode with multiple sequences at different
+        # stages, or prefill where each sequence resets to position 0).
         q_flat = q_normed.reshape(token_num, self.q_size)
-        k_flat = (k_normed if not self.is_kv_shared_layer else k_reshaped).reshape(token_num, self.kv_size)
-
         q_roped_flat = torch.empty(token_num, self.q_size, dtype=q_flat.dtype, device="npu")
-        rope_standard_layer(get_pointer(q_roped_flat),
-                   get_pointer(self.freqs_cis), get_pointer(q_flat),
-                   start_pos, token_num, self.num_heads, self.q_size,
-                   to_npu_dtype(hidden_states.dtype), get_default_stream())
 
         if not self.is_kv_shared_layer:
+            k_flat = k_normed.reshape(token_num, self.kv_size)
             k_roped_flat = torch.empty(token_num, self.kv_size, dtype=k_flat.dtype, device="npu")
-            rope_standard_layer(get_pointer(k_roped_flat),
-                       get_pointer(self.freqs_cis), get_pointer(k_flat),
-                       start_pos, token_num, self.num_kv_heads, self.kv_size,
-                       to_npu_dtype(hidden_states.dtype), get_default_stream())
+
+        batch_size = len(attn_metadata.seq_lens)
+        token_offset = 0
+        for batch_i in range(batch_size):
+            seq_len = attn_metadata.seq_lens[batch_i]
+            seq_start_pos = int(positions[token_offset].item())
+
+            # Q RoPE for this batch item
+            rope_standard_layer(
+                get_pointer(q_roped_flat[token_offset:token_offset + seq_len, ...]),
+                get_pointer(self.freqs_cis),
+                get_pointer(q_flat[token_offset:token_offset + seq_len, ...]),
+                seq_start_pos, seq_len, self.num_heads, self.q_size,
+                to_npu_dtype(hidden_states.dtype), get_default_stream())
+
+            # K RoPE for this batch item
+            if not self.is_kv_shared_layer:
+                rope_standard_layer(
+                    get_pointer(k_roped_flat[token_offset:token_offset + seq_len, ...]),
+                    get_pointer(self.freqs_cis),
+                    get_pointer(k_flat[token_offset:token_offset + seq_len, ...]),
+                    seq_start_pos, seq_len, self.num_kv_heads, self.kv_size,
+                    to_npu_dtype(hidden_states.dtype), get_default_stream())
+
+            token_offset += seq_len
+
+        if not self.is_kv_shared_layer:
             q = q_roped_flat
             k_out = k_roped_flat
             v_out = v_normed.reshape(token_num, self.kv_size)
+            self._should_write_kv = True
         else:
             q = q_roped_flat
-            k_out = k_flat
+            # KV-shared layers: K/V come from the shared cache (filled by L13/L14).
+            # K/V are computed but not written to cache and don't need RoPE.
+            k_out = k_reshaped.reshape(token_num, self.kv_size)
             v_out = v_reshaped.reshape(token_num, self.kv_size)
+            self._should_write_kv = False
 
         # Page attention with KV cache update.
-        # The dim256/dim512 kernels use n_tile=16 but vllm block_size=64.
-        # Expand page table: each vllm block becomes 4 kernel entries
-        # page_table_kernel[b*4 + c] = b * 4 + c (sequential K/V cache offsets)
+        # dim256 kernel: n_tile=64, each page_table entry = 1 vllm block (64 tokens)
+        # dim512 kernel: n_tile=64, each page_table entry = 1 vllm block (64 tokens)
+        # Both kernels access K/V at: key + page_table[ni] * n_tile * kv_dim
+        # Since n_tile = block_size = 64, page_table[ni] = physical block index directly.
         block_size = self.attn.block_size
-        kernel_n_tile = 16
-        chunk_per_block = block_size // kernel_n_tile  # 64 // 16 = 4
+        kernel_n_tile = 64  # matches both dim256 and dim512 kernel n_tile
 
         attn_output = torch.empty(q.shape, dtype=q.dtype, device="npu")
 
@@ -362,6 +383,7 @@ class Gemma4Attention(nn.Module):
             block_table_i = curr_offset // block_size
             curr_pos = curr_offset + curr_seq_len
 
+
             curr_seq_offset = 0
             while remain_seq_len > 0:
                 copy_seq_len = min(block_size - offset_in_block, remain_seq_len)
@@ -370,35 +392,35 @@ class Gemma4Attention(nn.Module):
                 k_cache_base = kv_cache[0, curr_block_table_host[block_table_i], offset_in_block, 0]
                 v_cache_base = kv_cache[1, curr_block_table_host[block_table_i], offset_in_block, 0]
 
-                ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes,
-                                          k_out[flat_seq_offset + curr_seq_offset].data_ptr(),
-                                          copy_bytes, 3, get_default_stream())
-                assert ret == 0, "failed to copy k cache"
-                ret = acl.rt.memcpy_async(v_cache_base.data_ptr(), copy_bytes,
-                                          v_out[flat_seq_offset + curr_seq_offset].data_ptr(),
-                                          copy_bytes, 3, get_default_stream())
-                assert ret == 0, "failed to copy v cache"
+                if self._should_write_kv:
+                    ret = acl.rt.memcpy_async(k_cache_base.data_ptr(), copy_bytes,
+                                              k_out[flat_seq_offset + curr_seq_offset].data_ptr(),
+                                              copy_bytes, 3, get_default_stream())
+                    assert ret == 0, "failed to copy k cache"
+                    ret = acl.rt.memcpy_async(v_cache_base.data_ptr(), copy_bytes,
+                                              v_out[flat_seq_offset + curr_seq_offset].data_ptr(),
+                                              copy_bytes, 3, get_default_stream())
+                    assert ret == 0, "failed to copy v cache"
 
                 remain_seq_len -= copy_seq_len
                 block_table_i += 1
                 offset_in_block = (offset_in_block + copy_seq_len) % block_size
                 curr_seq_offset += copy_seq_len
 
-            # Expand page table: each 16-token chunk gets a unique sequential offset
+            # Direct mapping: n_tile=64 = block_size, 1 page_table entry per vllm block
             num_kernel_entries = (curr_pos + kernel_n_tile - 1) // kernel_n_tile
-            expanded_table = []
-            for b in curr_block_table_host:
-                for c in range(chunk_per_block):
-                    expanded_table.append(b * chunk_per_block + c)
-            expanded_table = expanded_table[:num_kernel_entries]
-            expanded_table_npu = torch.tensor(expanded_table, dtype=torch.long, device="npu")
+            page_table_list = list(curr_block_table_host[:num_kernel_entries])
+            while len(page_table_list) < num_kernel_entries:
+                page_table_list.append(curr_block_table_host[-1])
+            page_table_npu = torch.tensor(page_table_list, dtype=torch.long, device="npu")
+
 
             qk_scale = 1.0
 
             if self.is_sliding:
                 page_attn_dim256_gqa_layer(
                     get_pointer(attn_output[flat_seq_offset, ...]),
-                    get_pointer(expanded_table_npu),
+                    get_pointer(page_table_npu),
                     get_pointer(q[flat_seq_offset:flat_seq_offset + curr_seq_len, ...]),
                     get_pointer(kv_cache[0, ...]),
                     get_pointer(kv_cache[1, ...]),
@@ -410,7 +432,7 @@ class Gemma4Attention(nn.Module):
                 group_size = self.num_heads // self.num_kv_heads
                 page_attn_gqa_dim512_layer(
                     get_pointer(attn_output[flat_seq_offset, ...]),
-                    get_pointer(expanded_table_npu),
+                    get_pointer(page_table_npu),
                     get_pointer(q[flat_seq_offset:flat_seq_offset + curr_seq_len, ...]),
                     get_pointer(kv_cache[0, ...]),
                     get_pointer(kv_cache[1, ...]),
@@ -720,7 +742,7 @@ class Gemma4Model(nn.Module):
         per_layer_embeds = per_layer_embeds * self.embed_scale_per_layer
 
         per_layer_embeds = per_layer_embeds.reshape(
-            *input_ids.shape,
+            -1,
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
         )
@@ -734,11 +756,14 @@ class Gemma4Model(nn.Module):
         if self.per_layer_model_projection is None:
             return None
 
-        per_layer_projection, _ = self.per_layer_model_projection(inputs_embeds)
+        # Flatten to 2D for linear layer: [batch, seq, hidden] -> [batch*seq, hidden]
+        num_tokens = inputs_embeds.shape[0] * inputs_embeds.shape[1] if inputs_embeds.ndim == 3 else inputs_embeds.shape[0]
+        flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
+        per_layer_projection, _ = self.per_layer_model_projection(flat_embeds)
         per_layer_projection = per_layer_projection * self.per_layer_projection_scale
 
         per_layer_projection = per_layer_projection.reshape(
-            *inputs_embeds.shape[:-1],
+            num_tokens,
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
         )
@@ -780,17 +805,34 @@ class Gemma4Model(nn.Module):
             residual = intermediate_tensors["residual"]
             per_layer_inputs = intermediate_tensors.get("per_layer_inputs")
 
+        kv_shared_sliding_src = 13  # L13 is the KV source for shared sliding layers
+        kv_shared_full_src = 14     # L14 is the KV source for shared full_attention layers
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             # Extract per-layer input for this specific layer
             layer_per_input = None
             if per_layer_inputs is not None:
-                layer_per_input = per_layer_inputs[:, i, :]
+                layer_per_input = per_layer_inputs[:, i, :].contiguous()  # [tokens, layer, dim] -> [tokens, dim]
+
+            # KV cache sharing: shared layers read from L13/L14's cache
+            if layer.self_attn.is_kv_shared_layer:
+                if layer.self_attn.is_sliding:
+                    cache_src = kv_shared_sliding_src
+                else:
+                    cache_src = kv_shared_full_src
+                local_src = cache_src - self.start_layer
+                if 0 <= local_src < len(kv_caches):
+                    layer_kv_cache = kv_caches[local_src]
+                else:
+                    layer_kv_cache = kv_caches[i - self.start_layer]
+            else:
+                layer_kv_cache = kv_caches[i - self.start_layer]
 
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                kv_caches[i - self.start_layer],
+                layer_kv_cache,
                 attn_metadata,
                 residual,
                 per_layer_input=layer_per_input,
