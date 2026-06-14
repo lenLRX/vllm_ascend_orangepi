@@ -799,9 +799,17 @@ class Gemma4Model(nn.Module):
             return per_layer_projection
 
         # Combine: (projection + per_layer_inputs) * 1/sqrt(2)
-        combined = per_layer_projection + per_layer_inputs
-        combined = combined * self.per_layer_input_scale
-        return combined
+        # Both tensors are in standard format after norm/embedding, so CCE kernels work.
+        combined = torch.empty_like(per_layer_projection)
+        add_layer(get_pointer(combined),
+                  get_pointer(per_layer_projection), get_pointer(per_layer_inputs),
+                  per_layer_projection.numel(),
+                  to_npu_dtype(per_layer_projection.dtype), get_default_stream())
+        result = torch.empty_like(combined)
+        mul_scalar_layer(get_pointer(result), get_pointer(combined),
+                         combined.numel(), float(self.per_layer_input_scale),
+                         to_npu_dtype(combined.dtype), get_default_stream())
+        return result
 
     def forward(
         self,
