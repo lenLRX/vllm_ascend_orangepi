@@ -196,8 +196,14 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
-        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
-        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        # Use torch.empty + copy_ to avoid torch.tensor(..., device=npu) JIT trigger
+        total_tokens = len(input_tokens)
+        tokens_cpu = torch.tensor(input_tokens, dtype=torch.long, device="cpu")
+        positions_cpu = torch.tensor(input_positions, dtype=torch.long, device="cpu")
+        input_tokens = torch.empty(total_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.empty(total_tokens, dtype=torch.long, device=self.device)
+        input_tokens.copy_(tokens_cpu)
+        input_positions.copy_(positions_cpu)
         #assert len(input_tokens) == 1
         #input_tokens = make_tensor_with_pad(input_tokens,
         #                                    pad=0,
@@ -252,8 +258,14 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 # CPU list is indexed. Pass (None, host_list) to eliminate .npu() JIT trigger.
                 input_block_tables.append((None, block_table))
 
-        input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
-        input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
+        # Use torch.empty + copy_ to avoid torch.tensor(..., device=npu) JIT trigger
+        total_tokens = len(input_tokens)
+        tokens_cpu = torch.tensor(input_tokens, dtype=torch.long, device="cpu")
+        positions_cpu = torch.tensor(input_positions, dtype=torch.long, device="cpu")
+        input_tokens = torch.empty(total_tokens, dtype=torch.long, device=self.device)
+        input_positions = torch.empty(total_tokens, dtype=torch.long, device=self.device)
+        input_tokens.copy_(tokens_cpu)
+        input_positions.copy_(positions_cpu)
 
         return input_tokens, input_positions, input_offsets, input_lengths, input_block_tables
 
