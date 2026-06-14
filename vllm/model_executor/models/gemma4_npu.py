@@ -725,7 +725,12 @@ class Gemma4Model(nn.Module):
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids) * self.normalizer
+        embeds = self.embed_tokens(input_ids)
+        out = torch.empty_like(embeds)
+        mul_scalar_layer(get_pointer(out), get_pointer(embeds),
+                         embeds.numel(), float(self.normalizer),
+                         to_npu_dtype(embeds.dtype), get_default_stream())
+        return out
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         if self.embed_tokens_per_layer is None:
