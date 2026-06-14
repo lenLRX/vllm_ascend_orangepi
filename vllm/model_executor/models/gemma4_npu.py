@@ -231,11 +231,6 @@ class Gemma4Attention(nn.Module):
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn")
 
-        # Pre-allocated page table buffer: max entries = max_pos / block_size rounded up
-        kernel_n_tile = 64  # matches both dim256 and dim512 kernel n_tile
-        max_page_entries = (max_position_embeddings + kernel_n_tile - 1) // kernel_n_tile
-        self._page_table_buf = torch.empty(max_page_entries, dtype=torch.long, device="npu")
-
     def _build_freqs_cis(self, max_pos, head_dim, theta, partial_rotary_factor=1.0):
         # Build freqs_cis table using numpy, then create tensor on NPU directly.
         # For partial RoPE (partial_rotary_factor < 1.0), non-rotated dimensions
@@ -417,15 +412,7 @@ class Gemma4Attention(nn.Module):
             page_table_list = list(curr_block_table_host[:num_kernel_entries])
             while len(page_table_list) < num_kernel_entries:
                 page_table_list.append(curr_block_table_host[-1])
-            # Use pre-allocated buffer + async H2D copy to avoid torch.tensor JIT trigger
-            page_table_cpu = torch.tensor(page_table_list, dtype=torch.long, device="cpu")
-            ret = acl.rt.memcpy_async(self._page_table_buf.data_ptr(),
-                                      num_kernel_entries * 8,
-                                      page_table_cpu.data_ptr(),
-                                      num_kernel_entries * 8,
-                                      1, get_default_stream())
-            assert ret == 0, "failed to copy page table"
-            page_table_npu = self._page_table_buf[:num_kernel_entries]
+            page_table_npu = torch.tensor(page_table_list, dtype=torch.long, device="npu")
 
 
             qk_scale = 1.0
