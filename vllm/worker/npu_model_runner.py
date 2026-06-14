@@ -6,7 +6,6 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
 
 import torch
 from torch import nn
-import acl
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -14,7 +13,6 @@ from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.core.scheduler import SchedulerOutputs
-from vllm.model_executor.layers.npu.util import get_default_stream
 
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
                              MultiModalKwargs)
@@ -136,14 +134,6 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
         self._previous_batch_request_ids: List[str] = []
 
-        # Pre-allocated block table buffer
-        # Each sequence needs up to ceil(max_model_len / block_size) entries
-        max_model_len = self.model_config.max_model_len
-        block_size = self.vllm_config.cache_config.block_size
-        self._max_blocks_per_seq = (max_model_len + block_size - 1) // block_size
-        self._block_table_buf = torch.empty(self._max_blocks_per_seq,
-                                            dtype=torch.long, device=self.device)
-
 
     def load_model(self) -> None:
         logger.info(f"Starting to load model {self.model_config.model} ...")
@@ -187,15 +177,9 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             assert seq_group_metadata.block_tables is not None
             #logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
             block_table = seq_group_metadata.block_tables[seq_id]
-            n_blocks = len(block_table)
-            bt_cpu = torch.tensor(block_table, dtype=torch.long, device="cpu")
-            ret = acl.rt.memcpy_async(self._block_table_buf.data_ptr(),
-                                      n_blocks * 8,
-                                      bt_cpu.data_ptr(), n_blocks * 8,
-                                      1, get_default_stream())
-            assert ret == 0, "failed to copy block table"
-            block_table_tup = (self._block_table_buf[:n_blocks], block_table)
-            input_block_tables.append(block_table_tup)
+            # Block table NPU tensor is never used downstream — only the CPU
+            # list is indexed. Pass (None, host_list) to eliminate .npu() JIT trigger.
+            input_block_tables.append((None, block_table))
             #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
@@ -266,15 +250,9 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 input_lengths.append(1)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
-                n_blocks = len(block_table)
-                bt_cpu = torch.tensor(block_table, dtype=torch.long, device="cpu")
-                ret = acl.rt.memcpy_async(self._block_table_buf.data_ptr(),
-                                          n_blocks * 8,
-                                          bt_cpu.data_ptr(), n_blocks * 8,
-                                          1, get_default_stream())
-                assert ret == 0, "failed to copy block table"
-                block_table_tup = (self._block_table_buf[:n_blocks], block_table)
-                input_block_tables.append(block_table_tup)
+                # Block table NPU tensor is never used downstream — only the
+                # CPU list is indexed. Pass (None, host_list) to eliminate .npu() JIT trigger.
+                input_block_tables.append((None, block_table))
 
         input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
         input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)

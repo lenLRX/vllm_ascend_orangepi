@@ -383,7 +383,7 @@ class Gemma4Attention(nn.Module):
             curr_seq_len = attn_metadata.seq_lens[batch_i]
             curr_offset = attn_metadata.offsets[batch_i]
             remain_seq_len = curr_seq_len
-            curr_block_table_npu, curr_block_table_host = attn_metadata.block_tables[batch_i]
+            _curr_block_table_npu, curr_block_table_host = attn_metadata.block_tables[batch_i]
             offset_in_block = curr_offset % block_size
             block_table_i = curr_offset // block_size
             curr_pos = curr_offset + curr_seq_len
