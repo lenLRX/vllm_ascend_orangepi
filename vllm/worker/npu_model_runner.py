@@ -288,7 +288,11 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             self.device,
             self.pin_memory,
             generators=self.get_generators(finished_requests_ids))
-        sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.npu()
+        # Use torch.empty + copy_ to avoid .npu() JIT trigger
+        sti_cpu = sampling_metadata.selected_token_indices
+        sti_npu = torch.empty(sti_cpu.shape, dtype=sti_cpu.dtype, device=self.device)
+        sti_npu.copy_(sti_cpu)
+        sampling_metadata.selected_token_indices = sti_npu
         attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths,
                                              block_tables=input_block_tables, is_prompt=is_prompt,
                                              start_positions=start_positions)
