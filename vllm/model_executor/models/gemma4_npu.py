@@ -749,12 +749,14 @@ class Gemma4Model(nn.Module):
         if self.embed_tokens_per_layer is None:
             return None
 
-        per_layer_inputs_mask = torch.logical_and(
-            input_ids >= 0,
-            input_ids < getattr(self.config, "vocab_size_per_layer_input", self.config.vocab_size),
-        )
-        per_layer_inputs_tokens = torch.where(
-            per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
+        # Compute mask on CPU to avoid torch.logical_and/torch.where TBE JIT triggers
+        vocab_size_per_layer = getattr(self.config, "vocab_size_per_layer_input",
+                                       self.config.vocab_size)
+        ids_cpu = input_ids.cpu()
+        mask_cpu = (ids_cpu >= 0) & (ids_cpu < vocab_size_per_layer)
+        tokens_cpu = torch.where(mask_cpu, ids_cpu, torch.zeros_like(ids_cpu))
+        per_layer_inputs_tokens = torch.empty_like(input_ids)
+        per_layer_inputs_tokens.copy_(tokens_cpu)
 
         per_layer_embeds = self.embed_tokens_per_layer(per_layer_inputs_tokens)
         # Replace scalar mul with CCE kernel to avoid TBE JIT trigger
