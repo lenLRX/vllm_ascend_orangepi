@@ -757,7 +757,12 @@ class Gemma4Model(nn.Module):
             per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
 
         per_layer_embeds = self.embed_tokens_per_layer(per_layer_inputs_tokens)
-        per_layer_embeds = per_layer_embeds * self.embed_scale_per_layer
+        # Replace scalar mul with CCE kernel to avoid TBE JIT trigger
+        _ple_out = torch.empty_like(per_layer_embeds)
+        mul_scalar_layer(get_pointer(_ple_out), get_pointer(per_layer_embeds),
+                         per_layer_embeds.numel(), float(self.embed_scale_per_layer),
+                         to_npu_dtype(per_layer_embeds.dtype), get_default_stream())
+        per_layer_embeds = _ple_out
 
         per_layer_embeds = per_layer_embeds.reshape(
             -1,
