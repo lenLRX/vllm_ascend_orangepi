@@ -225,7 +225,6 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         input_positions: List[List[int]] = []
         input_offsets: List[int] = []
         input_lengths: List[int] = []
-        context_lens: List[int] = []
         input_block_tables = []
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -244,7 +243,6 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
                 input_positions.append(position)
-                context_lens.append(seq_len)
 
                 input_offsets.append(position)
                 input_lengths.append(1)
@@ -256,21 +254,6 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
         input_tokens = torch.tensor(input_tokens, dtype=torch.long, device=self.device)
         input_positions = torch.tensor(input_positions, dtype=torch.long, device=self.device)
-
-        #assert len(input_tokens) == 1
-        #input_tokens = make_tensor_with_pad(input_tokens,
-        #                                    pad=0,
-        #                                    max_len=1,
-        #                                    dtype=torch.long,
-        #                                    device=self.device)
-        #input_positions = make_tensor_with_pad(input_positions,
-        #                                       pad=0,
-        #                                       max_len=1,
-        #                                       dtype=torch.long,
-        #                                       device=self.device)
-        context_lens = torch.tensor(context_lens,
-                                    dtype=torch.int,
-                                    device=self.device)
 
         return input_tokens, input_positions, input_offsets, input_lengths, input_block_tables
 
