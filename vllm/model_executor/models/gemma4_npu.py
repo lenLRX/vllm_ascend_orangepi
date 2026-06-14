@@ -328,7 +328,7 @@ class Gemma4Attention(nn.Module):
         token_offset = 0
         for batch_i in range(batch_size):
             seq_len = attn_metadata.seq_lens[batch_i]
-            seq_start_pos = int(positions[token_offset].item())
+            seq_start_pos = attn_metadata.start_positions[batch_i]
 
             # Q RoPE for this batch item
             rope_standard_layer(

@@ -37,6 +37,7 @@ class NPUAttentionMetadata:
     seq_lens: Optional[List[int]] = None
     block_tables: Optional[List] = None
     is_prompt: bool = None
+    start_positions: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         input_offsets: List[int] = []
         input_lengths: List[int] = []
         input_block_tables = []
+        start_positions: List[int] = []
 
         seq_lens: List[int] = []
         multi_modal_kwargs_list: List[MultiModalKwargs] = []
@@ -166,6 +168,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
 
             input_offsets.append(0)
             input_lengths.append(seq_len)
+            start_positions.append(0)
 
             #input_tokens.append(prompt_tokens)
             input_tokens.extend(prompt_tokens)
@@ -210,7 +213,7 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
 
         return (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
-                multi_modal_kwargs, input_block_tables)
+                multi_modal_kwargs, input_block_tables, start_positions)
 
     def _prepare_decode(
         self,
@@ -286,12 +289,13 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         # Prepare input tensors.
         if is_prompt:
             (input_tokens, input_positions, input_offsets, input_lengths, seq_lens,
-             multi_modal_kwargs, input_block_tables
+             multi_modal_kwargs, input_block_tables, start_positions
              ) = self._prepare_prompt(seq_group_metadata_list)
         else:
             (input_tokens, input_positions,
              input_offsets, input_lengths, input_block_tables) = self._prepare_decode(seq_group_metadata_list)
             seq_lens = None
+            start_positions = input_offsets  # decode: start position = offset (which is seq_len - 1)
         sampling_metadata = SamplingMetadata.prepare(
             seq_group_metadata_list,
             seq_lens,
@@ -301,7 +305,8 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             generators=self.get_generators(finished_requests_ids))
         sampling_metadata.selected_token_indices = sampling_metadata.selected_token_indices.npu()
         attn_metadata = NPUAttentionMetadata(offsets=input_offsets, seq_lens=input_lengths,
-                                             block_tables=input_block_tables, is_prompt=is_prompt)
+                                             block_tables=input_block_tables, is_prompt=is_prompt,
+                                             start_positions=start_positions)
         return ModelInputForNPU(input_tokens=input_tokens,
                                 input_positions=input_positions,
                                 sampling_metadata=sampling_metadata,
