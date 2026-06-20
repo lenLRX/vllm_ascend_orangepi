@@ -543,10 +543,15 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers.
         # Data-dependent (a learned per-layer weight) so it must stay a buffer,
-        # but its value is fixed after load, so we cache float(layer_scalar) on
-        # first forward to avoid a per-layer .item() D2H sync (see forward()).
-        self.register_buffer("layer_scalar", torch.ones(1))
-        self._layer_scalar_f = None
+        # but its value is fixed after load and the forward reads it only via the
+        # cached Python float _layer_scalar_f (set in Gemma4Model.load_weights),
+        # never from the NPU buffer.  So create the buffer with torch.empty, NOT
+        # torch.ones — under the NPU device context torch.ones JIT-compiles a
+        # te_OnesLike TBE kernel — and default the cached float to 1.0 (a no-op
+        # scale if no checkpoint loads it).  load_weights also skips filling the
+        # buffer (avoids a te_Fill); its device value is intentionally unused.
+        self.register_buffer("layer_scalar", torch.empty(1))
+        self._layer_scalar_f = 1.0
 
     def forward(
         self,
@@ -622,12 +627,13 @@ class Gemma4DecoderLayer(nn.Module):
                       get_default_stream())
             hidden_states = new_hidden
 
-        # Layer scalar multiplication.  _layer_scalar_f is normally pre-filled
-        # at load time (see Gemma4Model.load_weights) so this incurs no .item()
-        # in the forward path.  The guard is a defensive fallback for the case
-        # where the buffer was not loaded from a checkpoint (stays 1.0).
+        # Layer scalar multiplication.  _layer_scalar_f is a Python float set at
+        # load time (see Gemma4Model.load_weights; defaults to 1.0 = no-op scale
+        # if no checkpoint), so the forward never reads the NPU buffer / does an
+        # .item().  The guard is a defensive fallback that must NOT read the
+        # buffer (it is uninitialized torch.empty — see __init__).
         if self._layer_scalar_f is None:
-            self._layer_scalar_f = float(self.layer_scalar)
+            self._layer_scalar_f = 1.0
         new_hidden = torch.empty_like(hidden_states)
         mul_scalar_layer(get_pointer(new_hidden), get_pointer(hidden_states),
                          hidden_states.numel(),
@@ -966,17 +972,20 @@ class Gemma4Model(nn.Module):
                 # Handle buffers (layer_scalar, etc.)
                 if name in params_dict:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    # Hoist the layer_scalar read out of the forward path: cache
-                    # its float now from the CPU-side checkpoint tensor (no NPU
-                    # D2H sync) so Gemma4DecoderLayer.forward never needs a
-                    # per-layer .item().  loaded_weight is bf16 [1] on CPU here,
-                    # so float() is numerically identical to float(buffer).
                     if name.endswith(".layer_scalar"):
+                        # The forward multiplies via mul_scalar_layer using this
+                        # cached Python float; the NPU buffer's value is never
+                        # read.  So SKIP default_weight_loader — its
+                        # param.data.fill_(loaded_weight.item()) JIT-compiles a
+                        # te_Fill TBE kernel under the NPU device — and just cache
+                        # the float from the CPU checkpoint tensor (no D2H sync).
+                        # loaded_weight is bf16 [1] on CPU, so float() is exact.
                         owner = self.get_submodule(name.rsplit(".", 1)[0])
                         owner._layer_scalar_f = float(loaded_weight)
+                    else:
+                        weight_loader = getattr(param, "weight_loader",
+                                                default_weight_loader)
+                        weight_loader(param, loaded_weight)
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
