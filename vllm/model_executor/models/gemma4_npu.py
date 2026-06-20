@@ -765,7 +765,16 @@ class Gemma4Model(nn.Module):
         num_tokens = inputs_embeds.shape[0] * inputs_embeds.shape[1] if inputs_embeds.ndim == 3 else inputs_embeds.shape[0]
         flat_embeds = inputs_embeds.reshape(-1, inputs_embeds.shape[-1])
         per_layer_projection, _ = self.per_layer_model_projection(flat_embeds)
-        per_layer_projection = per_layer_projection * self.per_layer_projection_scale
+        # Scale via CCE kernel to avoid the aten.mul TBE JIT trigger.
+        # MUST be in-place (out ptr == in ptr).  Writing into a separate
+        # torch.empty_like()/padded output here garbles decode (the kernel's
+        # values are correct to ~1 ULP, but a fresh output allocation at this
+        # site corrupts downstream memory); in-place into the matmul output —
+        # which the model already owns and consumes next — is clean and safe
+        # for an elementwise scalar mul.  Do not "refactor" to a temp buffer.
+        mul_scalar_layer(get_pointer(per_layer_projection), get_pointer(per_layer_projection),
+                         per_layer_projection.numel(), float(self.per_layer_projection_scale),
+                         to_npu_dtype(per_layer_projection.dtype), get_default_stream())
 
         per_layer_projection = per_layer_projection.reshape(
             num_tokens,
