@@ -73,16 +73,36 @@ class CacheEngine:
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
+        # On NPU, torch.zeros(...) JIT-compiles a te_Fill/te_ZerosLike TBE
+        # kernel.  Zero-init via torch.empty + the prebuilt fill_layer kernel
+        # instead (no compile).  Only 16-bit float caches are supported by the
+        # kernel; anything else (e.g. fp8 KV cache) falls back to torch.zeros.
+        use_fill_kernel = (device != "cpu" and current_platform.is_npu()
+                           and self.dtype in (torch.float16, torch.bfloat16))
+        if use_fill_kernel:
+            from vllm.model_executor.layers.npu.util import (
+                get_default_stream, get_pointer, to_npu_dtype)
+            from vllm.model_executor.layers.npu.py_npu_ops import fill_layer
         kv_cache: List[torch.Tensor] = []
         for _ in range(self.num_attention_layers):
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
-            kv_cache.append(
-                torch.zeros(kv_cache_shape,
-                            dtype=self.dtype,
-                            pin_memory=pin_memory,
-                            device=device))
+            if use_fill_kernel:
+                entry = torch.empty(kv_cache_shape,
+                                    dtype=self.dtype,
+                                    device=device)
+                fill_layer(get_pointer(entry), entry.numel(), 0.0,
+                           to_npu_dtype(self.dtype), get_default_stream())
+            else:
+                entry = torch.zeros(kv_cache_shape,
+                                    dtype=self.dtype,
+                                    pin_memory=pin_memory,
+                                    device=device)
+            kv_cache.append(entry)
+        if use_fill_kernel:
+            # Ensure the null block is zeroed before the block allocator uses it.
+            torch.npu.synchronize()
         return kv_cache
 
     def swap_in(self, src_to_dst: torch.Tensor) -> None:
