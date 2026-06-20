@@ -665,11 +665,7 @@ class Gemma4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens_per_layer",
             )
-            self.register_buffer(
-                "embed_scale_per_layer",
-                torch.tensor(self.hidden_size_per_layer_input ** 0.5),
-                persistent=False,
-            )
+            self.embed_scale_per_layer = float(self.hidden_size_per_layer_input ** 0.5)
             self.per_layer_model_projection = ReplicatedLinear(
                 config.hidden_size,
                 total_ple_dim,
@@ -679,16 +675,8 @@ class Gemma4Model(nn.Module):
             )
             self.per_layer_projection_norm = Gemma4RMSNorm(
                 self.hidden_size_per_layer_input, eps=config.rms_norm_eps)
-            self.register_buffer(
-                "per_layer_input_scale",
-                torch.rsqrt(torch.tensor(2.0)),
-                persistent=False,
-            )
-            self.register_buffer(
-                "per_layer_projection_scale",
-                torch.tensor(config.hidden_size ** -0.5),
-                persistent=False,
-            )
+            self.per_layer_input_scale = float(2.0 ** -0.5)
+            self.per_layer_projection_scale = float(config.hidden_size ** -0.5)
         else:
             self.embed_tokens_per_layer = None
             self.embed_scale_per_layer = None
@@ -717,12 +705,10 @@ class Gemma4Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        # Embedding scale = sqrt(hidden_size)
-        self.register_buffer(
-            "normalizer",
-            torch.tensor(config.hidden_size ** 0.5),
-            persistent=False,
-        )
+        # Embedding scale = sqrt(hidden_size). Pure config constant, not data
+        # dependent — keep as a plain Python float so the CCE scalar arg needs
+        # no float(tensor) D2H sync per call.
+        self.normalizer = float(config.hidden_size ** 0.5)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
