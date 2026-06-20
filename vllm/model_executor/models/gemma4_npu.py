@@ -34,7 +34,7 @@ from vllm.model_executor.layers.npu.py_npu_ops import (
     page_attn_gqa_dim512_layer, page_attn_dim256_gqa_layer,
     rope_standard_layer,
     add_layer, rmsnorm_layer, gelu_pytorch_tanh_layer, mul_scalar_layer,
-    mul_layer)
+    mul_layer, ple_slice_layer)
 
 import acl
 
@@ -832,12 +832,32 @@ class Gemma4Model(nn.Module):
         kv_shared_sliding_src = 13  # L13 is the KV source for shared sliding layers
         kv_shared_full_src = 14     # L14 is the KV source for shared full_attention layers
 
+        # PLE per-layer slice constants (shape metadata only, no D2H sync).
+        # The custom ple_slice_layer kernel replaces the strided
+        # per_layer_inputs[:, i, :].contiguous(), which JIT-compiled a distinct
+        # te_StridedSliceD per layer (35 cold compiles).
+        if per_layer_inputs is not None:
+            ple_num_tokens = per_layer_inputs.shape[0]
+            ple_num_layers = self.config.num_hidden_layers
+            ple_block_bytes = (self.hidden_size_per_layer_input
+                               * per_layer_inputs.element_size())
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             # Extract per-layer input for this specific layer
             layer_per_input = None
             if per_layer_inputs is not None:
-                layer_per_input = per_layer_inputs[:, i, :].contiguous()  # [tokens, layer, dim] -> [tokens, dim]
+                # Custom CCE kernel gathers per_layer_inputs[:, i, :] into a
+                # contiguous [tokens, dim] buffer.  layer index i is a runtime
+                # arg -> a single compiled kernel serves every layer (no
+                # per-offset TBE StridedSliceD JIT compile).
+                layer_per_input = per_layer_inputs.new_empty(
+                    (ple_num_tokens, self.hidden_size_per_layer_input))
+                ple_slice_layer(
+                    get_pointer(layer_per_input),
+                    get_pointer(per_layer_inputs),
+                    i, ple_num_tokens, ple_num_layers, ple_block_bytes,
+                    get_default_stream())
 
             # KV cache sharing: shared layers read from L13/L14's cache
             if layer.self_attn.is_kv_shared_layer:
