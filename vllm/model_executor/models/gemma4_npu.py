@@ -622,9 +622,11 @@ class Gemma4DecoderLayer(nn.Module):
                       get_default_stream())
             hidden_states = new_hidden
 
-        # Layer scalar multiplication
+        # Layer scalar multiplication.  _layer_scalar_f is normally pre-filled
+        # at load time (see Gemma4Model.load_weights) so this incurs no .item()
+        # in the forward path.  The guard is a defensive fallback for the case
+        # where the buffer was not loaded from a checkpoint (stays 1.0).
         if self._layer_scalar_f is None:
-            # One-time D2H read of the learned scalar; reused every forward after.
             self._layer_scalar_f = float(self.layer_scalar)
         new_hidden = torch.empty_like(hidden_states)
         mul_scalar_layer(get_pointer(new_hidden), get_pointer(hidden_states),
@@ -947,6 +949,14 @@ class Gemma4Model(nn.Module):
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
+                    # Hoist the layer_scalar read out of the forward path: cache
+                    # its float now from the CPU-side checkpoint tensor (no NPU
+                    # D2H sync) so Gemma4DecoderLayer.forward never needs a
+                    # per-layer .item().  loaded_weight is bf16 [1] on CPU here,
+                    # so float() is numerically identical to float(buffer).
+                    if name.endswith(".layer_scalar"):
+                        owner = self.get_submodule(name.rsplit(".", 1)[0])
+                        owner._layer_scalar_f = float(loaded_weight)
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
