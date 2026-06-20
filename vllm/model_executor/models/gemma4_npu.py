@@ -541,8 +541,12 @@ class Gemma4DecoderLayer(nn.Module):
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
 
-        # Layer scalar (loaded from checkpoint) — applies to ALL text layers
+        # Layer scalar (loaded from checkpoint) — applies to ALL text layers.
+        # Data-dependent (a learned per-layer weight) so it must stay a buffer,
+        # but its value is fixed after load, so we cache float(layer_scalar) on
+        # first forward to avoid a per-layer .item() D2H sync (see forward()).
         self.register_buffer("layer_scalar", torch.ones(1))
+        self._layer_scalar_f = None
 
     def forward(
         self,
@@ -619,10 +623,13 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = new_hidden
 
         # Layer scalar multiplication
+        if self._layer_scalar_f is None:
+            # One-time D2H read of the learned scalar; reused every forward after.
+            self._layer_scalar_f = float(self.layer_scalar)
         new_hidden = torch.empty_like(hidden_states)
         mul_scalar_layer(get_pointer(new_hidden), get_pointer(hidden_states),
                          hidden_states.numel(),
-                         float(self.layer_scalar),
+                         self._layer_scalar_f,
                          to_npu_dtype(hidden_states.dtype),
                          get_default_stream())
         hidden_states = new_hidden
