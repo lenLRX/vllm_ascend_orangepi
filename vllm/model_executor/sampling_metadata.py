@@ -166,9 +166,11 @@ class SamplingMetadata:
             pin_memory=pin_memory,
         )
         categorized_sample_indices = {
+            # Build directly as int64 so sampler.py's `sample_indices.long()`
+            # is a no-op (avoids a per-token int32->int64 te_Cast on the NPU).
             t: async_tensor_h2d(
                 seq_ids,
-                dtype=torch.int,
+                dtype=torch.long,
                 target_device=device,
                 pin_memory=pin_memory,
             )
