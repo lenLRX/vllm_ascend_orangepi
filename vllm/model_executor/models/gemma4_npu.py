@@ -179,13 +179,14 @@ class Gemma4Attention(nn.Module):
         self.sliding_window = None
         self.partial_rotary_factor = 1.0
         self.rope_theta = 10000.0
+        self.layer_idx = 0
 
         if hasattr(config, 'layer_types'):
             m = re.search(r'layers\.(\d+)', prefix)
             if m:
-                layer_idx = int(m.group(1))
-                if layer_idx < len(config.layer_types):
-                    layer_type = config.layer_types[layer_idx]
+                self.layer_idx = int(m.group(1))
+                if self.layer_idx < len(config.layer_types):
+                    layer_type = config.layer_types[self.layer_idx]
                     self.is_sliding = layer_type == "sliding_attention"
                     self.is_full_attention = layer_type == "full_attention"
 
@@ -206,12 +207,9 @@ class Gemma4Attention(nn.Module):
         self.is_kv_shared_layer = False
         num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
         if num_kv_shared_layers > 0:
-            m = re.search(r'layers\.(\d+)', prefix)
-            if m:
-                layer_idx = int(m.group(1))
-                first_kv_shared = config.num_hidden_layers - num_kv_shared_layers
-                if layer_idx >= first_kv_shared:
-                    self.is_kv_shared_layer = True
+            first_kv_shared = config.num_hidden_layers - num_kv_shared_layers
+            if self.layer_idx >= first_kv_shared:
+                self.is_kv_shared_layer = True
 
         # Build freqs_cis table: [max_position_embeddings, head_dim]
         # partial_rotary_factor < 1.0: non-rotated dims get cos=1, sin=0
@@ -374,6 +372,9 @@ class Gemma4Attention(nn.Module):
 
         flat_seq_offset = 0
         batch_size = len(attn_metadata.seq_lens)
+        # Retain per-sequence page tables until all kernels have been launched,
+        # otherwise an async kernel may read freed/reused memory.
+        page_table_tensors = []
         for batch_i in range(batch_size):
             curr_seq_len = attn_metadata.seq_lens[batch_i]
             curr_offset = attn_metadata.offsets[batch_i]
@@ -382,7 +383,6 @@ class Gemma4Attention(nn.Module):
             offset_in_block = curr_offset % block_size
             block_table_i = curr_offset // block_size
             curr_pos = curr_offset + curr_seq_len
-
 
             curr_seq_offset = 0
             while remain_seq_len > 0:
@@ -413,7 +413,7 @@ class Gemma4Attention(nn.Module):
             while len(page_table_list) < num_kernel_entries:
                 page_table_list.append(curr_block_table_host[-1])
             page_table_npu = torch.tensor(page_table_list, dtype=torch.long, device="npu")
-
+            page_table_tensors.append(page_table_npu)
 
             qk_scale = 1.0
 
@@ -442,6 +442,9 @@ class Gemma4Attention(nn.Module):
                     to_npu_dtype(q.dtype), get_default_stream())
 
             flat_seq_offset += curr_seq_len
+
+        if page_table_tensors:
+            torch.npu.synchronize()
 
         output, _ = self.o_proj(attn_output)
         return output
