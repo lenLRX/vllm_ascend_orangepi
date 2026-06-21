@@ -590,6 +590,35 @@ class ModelConfig:
         return (self.hf_text_config.hidden_size //
                 self.hf_text_config.num_attention_heads)
 
+    def get_layer_head_sizes(self, parallel_config: "ParallelConfig") -> List[int]:
+        """Return a list of KV head sizes, one per attention layer.
+
+        Most models use the same head size for every layer.  Gemma4 is an
+        exception: local (sliding) layers use ``head_dim`` while global
+        (full-attention) layers use ``global_head_dim``.  Allocating every KV
+        cache slot with the larger size wastes memory for sliding layers, but
+        it keeps the kernel's flat offset arithmetic (``page * n_tile *
+        kv_head_dim``) correct for both layer types.
+        """
+        num_layers = self.get_num_attention_layers(parallel_config)
+        base_head_size = self.get_head_size()
+
+        layer_types = getattr(self.hf_text_config, "layer_types", None)
+        if layer_types is None:
+            return [base_head_size] * num_layers
+
+        global_head_dim = getattr(self.hf_text_config, "global_head_dim", None)
+        if global_head_dim is None or global_head_dim == base_head_size:
+            return [base_head_size] * num_layers
+
+        sizes = []
+        for idx in range(num_layers):
+            if idx < len(layer_types) and layer_types[idx] == "full_attention":
+                sizes.append(global_head_dim)
+            else:
+                sizes.append(base_head_size)
+        return sizes
+
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
         # For GPTBigCode & Falcon:

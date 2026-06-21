@@ -38,6 +38,7 @@ class CacheEngine:
         self.num_attention_layers = model_config.get_num_attention_layers(
             parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+        self.layer_head_sizes = model_config.get_layer_head_sizes(parallel_config)
 
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
@@ -70,8 +71,6 @@ class CacheEngine:
         device: str,
     ) -> List[torch.Tensor]:
         """Allocates KV cache on the specified device."""
-        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         # On NPU, torch.zeros(...) JIT-compiles a te_Fill/te_ZerosLike TBE
         # kernel.  Zero-init via torch.empty + the prebuilt fill_layer kernel
@@ -84,7 +83,10 @@ class CacheEngine:
                 get_default_stream, get_pointer, to_npu_dtype)
             from vllm.model_executor.layers.npu.py_npu_ops import fill_layer
         kv_cache: List[torch.Tensor] = []
-        for _ in range(self.num_attention_layers):
+        for layer_idx in range(self.num_attention_layers):
+            layer_head_size = self.layer_head_sizes[layer_idx]
+            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                num_blocks, self.block_size, self.num_kv_heads, layer_head_size)
             # null block in CpuGpuBlockAllocator requires at least that
             # block to be zeroed-out.
             # We zero-out everything for simplicity.
@@ -124,14 +126,16 @@ class CacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
-        head_size = model_config.get_head_size()
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_attention_layers = model_config.get_num_attention_layers(
             parallel_config)
+        layer_head_sizes = model_config.get_layer_head_sizes(parallel_config)
 
-        key_cache_block = cache_config.block_size * num_heads * head_size
-        value_cache_block = key_cache_block
-        total = num_attention_layers * (key_cache_block + value_cache_block)
+        total = 0
+        for layer_head_size in layer_head_sizes:
+            key_cache_block = cache_config.block_size * num_heads * layer_head_size
+            value_cache_block = key_cache_block
+            total += key_cache_block + value_cache_block
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
         else:
