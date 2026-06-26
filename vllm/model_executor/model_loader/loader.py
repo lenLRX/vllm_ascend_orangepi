@@ -1126,53 +1126,130 @@ class GGUFModelLoader(BaseModelLoader):
             if arch is None:
                 raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         # Gemma4 nests num_hidden_layers inside text_config
-        if hasattr(config, 'num_hidden_layers'):
-            num_layers = config.num_hidden_layers
-        elif hasattr(config, 'text_config') and config.text_config is not None:
+        if (hasattr(config, 'text_config') and config.text_config is not None
+                and hasattr(config.text_config, 'num_hidden_layers')):
             num_layers = config.text_config.num_hidden_layers
+        elif hasattr(config, 'num_hidden_layers'):
+            num_layers = config.num_hidden_layers
         else:
             raise RuntimeError(f"Cannot determine num_hidden_layers for {model_type}")
         name_map = gguf.get_tensor_name_map(arch, num_layers)
 
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+
         if model_type == "gemma4":
-            # Gemma4 not supported by transformers. Use the gguf library
-            # to read tensor names and build the name map with gemma arch.
+            # Gemma4 isn't supported by transformers. Build the GGUF→HF
+            # name map directly using the gguf library's mapping tables.
+            #
+            # We reverse the standard vLLM approach: instead of iterating
+            # HF state_dict names and calling get_name(HF→GGUF), we build
+            # a reverse lookup from the mapping tables and match against
+            # actual GGUF tensor names.
+
+            # 1. Reverse the non-block mapping: gguf_name → hf_name
+            #    Skip block entries (they contain "blk" or "{bid}")
+            #    because mappings_cfg instantiated wrong-arch templates.
+            _reverse_map = {}
+            for hf_name, (ttype, gguf_base) in name_map.mapping.items():
+                if "blk" in str(gguf_base) or "{bid}" in str(gguf_base):
+                    continue  # block entry, handled via _block_reverse
+                if gguf_base not in _reverse_map:
+                    _reverse_map[gguf_base] = hf_name
+
+            # 2. Per-block: build reverse map gguf_suffix → hf_template
+            _block_reverse = {}
+            for ttype, hf_templates in name_map.block_mappings_cfg.items():
+                if not hf_templates:
+                    continue
+                # first template is the canonical one
+                canonical = hf_templates[0]
+                # Extract the GGUF suffix from the type name (e.g., ATTN_Q → attn_q)
+                ttype_name = ttype.name.lower()  # e.g., "attn_q"
+                _block_reverse[ttype_name] = canonical
+
+            # 3. Additional block mappings: GGUF suffix → HF template.
+            #    Some GGUF suffixes differ from the gguf type enum names
+            #    (e.g., attn_output vs ATTN_OUT, inp_gate vs PER_LAYER_INP_GATE).
+            _gguf_suffix_to_template = {
+                # Standard: GGUF suffix matches lowercased enum name
+                "attn_q":       "model.layers.{bid}.self_attn.q_proj",
+                "attn_k":       "model.layers.{bid}.self_attn.k_proj",
+                "attn_v":       "model.layers.{bid}.self_attn.v_proj",
+                "attn_output":  "model.layers.{bid}.self_attn.o_proj",
+                "attn_norm":    "model.layers.{bid}.input_layernorm",
+                "attn_q_norm":  "model.layers.{bid}.self_attn.q_norm",
+                "attn_k_norm":  "model.layers.{bid}.self_attn.k_norm",
+                "ffn_norm":     "model.layers.{bid}.mlp.pre_ffn_layernorm",
+                "ffn_gate":     "model.layers.{bid}.mlp.gate_proj",
+                "ffn_up":       "model.layers.{bid}.mlp.up_proj",
+                "ffn_down":     "model.layers.{bid}.mlp.down_proj",
+                "post_attention_layernorm": "model.layers.{bid}.post_attention_layernorm",
+                "post_feedforward_layernorm": "model.layers.{bid}.post_feedforward_layernorm",
+                # Gemma4-specific
+                "inp_gate":     "model.layers.{bid}.per_layer_input_gate",
+                "proj":         "model.layers.{bid}.per_layer_projection",
+                "post_attention_norm": "model.layers.{bid}.post_attention_layernorm",
+                "post_ffw_norm": "model.layers.{bid}.post_ffw_layernorm",
+                "post_norm":    "model.layers.{bid}.post_per_layer_input_norm",
+                "layer_output_scale": "model.layers.{bid}.layer_output_scale",
+            }
+            _block_reverse.update(_gguf_suffix_to_template)
+
+            # 4. Override global mappings to prefer "model." prefix variants
+            #    (vLLM uses model.* for all parameters)
+            _reverse_map["token_embd"] = "model.embed_tokens"
+            _reverse_map["output_norm"] = "model.norm"
+            _reverse_map["per_layer_model_proj"] = "model.per_layer_model_projection"
+            _reverse_map["per_layer_proj_norm"] = "model.per_layer_proj_norm"
+            _reverse_map["per_layer_token_embd"] = "model.embed_tokens_per_layer"
+            _reverse_map["rope_freqs"] = "model.rope_freqs"
+
+            # 5. Read GGUF tensor names and build the final map
             gguf_path = model_config.model
             gguf_reader = gguf.GGUFReader(gguf_path)
             gguf_to_hf_name_map = {}
+            import re
+            _blk_pat = re.compile(r'blk\.(\d+)\.(.+)')
+
             for tensor in gguf_reader.tensors:
-                gguf_name_full = tensor.name
-                if "." in gguf_name_full:
-                    name, suffix = gguf_name_full.rsplit(".", 1)
+                gguf_full = tensor.name
+                if "." in gguf_full:
+                    name, suffix = gguf_full.rsplit(".", 1)
                 else:
-                    name, suffix = gguf_name_full, ""
-                hf_name = name_map.get_name(name)
+                    name, suffix = gguf_full, ""
+
+                # Try non-block mapping first
+                hf_name = _reverse_map.get(name)
                 if hf_name is not None:
-                    gguf_to_hf_name_map[gguf_name_full] = f"{hf_name}.{suffix}" if suffix else hf_name
-                else:
-                    # Gemma4-specific renames that the gemma name map
-                    # doesn't know about
-                    RENAMES = {
-                        "per_layer_model_proj": "per_layer_model_projection",
-                        "per_layer_proj_norm": "per_layer_proj_norm",
-                        "per_layer_token_embd": "per_layer_token_embd",
-                        "token_embd": "model.embed_tokens",
-                        "output_norm": "model.norm",
-                        "rope_freqs": "rope_freqs",
-                    }
-                    mapped = name
-                    for old, new in RENAMES.items():
-                        mapped = mapped.replace(old, new)
-                    # Map per-layer tensors: blk.X.inp_gate → blk.X.per_layer_input_gate
-                    mapped = mapped.replace(".inp_gate", ".per_layer_input_gate")
-                    # .proj in blk context → per_layer_projection
-                    if ".proj" in mapped and ".o_proj" not in mapped:
-                        mapped = mapped.replace(".proj", ".per_layer_projection")
-                    mapped = mapped.replace(".attn_q_norm", ".self_attn.q_norm")
-                    mapped = mapped.replace(".attn_k_norm", ".self_attn.k_norm")
-                    mapped = mapped.replace(".post_attention_norm", ".post_attention_layernorm")
-                    mapped = mapped.replace(".post_ffw_norm", ".post_ffw_layernorm")
-                    gguf_to_hf_name_map[gguf_name_full] = f"{mapped}.{suffix}" if suffix else mapped
+                    gguf_to_hf_name_map[gguf_full] = f"{hf_name}.{suffix}" if suffix else hf_name
+                    continue
+
+                # Try block mapping: blk.N.something → model.layers.N.*
+                m = _blk_pat.match(name)
+                if m:
+                    bid = m.group(1)
+                    blk_suffix = m.group(2)
+                    template = _block_reverse.get(blk_suffix)
+                    if template is not None:
+                        hf_name = template.replace("{bid}", bid)
+                        gguf_to_hf_name_map[gguf_full] = f"{hf_name}.{suffix}" if suffix else hf_name
+                        continue
+
+                # Fallback: pass through unchanged
+                gguf_to_hf_name_map[gguf_full] = gguf_full
+                _logger.warning("GGUF gemma4: unmapped tensor %s", gguf_full)
+
+            _logger.info("GGUF gemma4: built name map with %d entries, "
+                         "block types: %s",
+                         len(gguf_to_hf_name_map),
+                         sorted(_block_reverse.keys()))
+            # Verify no unmapped blk.* entries
+            for k, v in gguf_to_hf_name_map.items():
+                if 'blk' in v:
+                    _logger.error("BUG: unmapped blk in value: %s -> %s", k, v)
+                    _logger.error("block_reverse keys: %s", sorted(_block_reverse.keys()))
+                    raise RuntimeError(f"Name map contains blk: {k} -> {v}")
             return gguf_to_hf_name_map
 
         # Ensure config has _name_or_path for from_config
