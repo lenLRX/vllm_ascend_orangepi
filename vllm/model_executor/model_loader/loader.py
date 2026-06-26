@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import os
+import struct
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
@@ -1132,27 +1133,54 @@ class GGUFModelLoader(BaseModelLoader):
         else:
             raise RuntimeError(f"Cannot determine num_hidden_layers for {model_type}")
         name_map = gguf.get_tensor_name_map(arch, num_layers)
+
+        if model_type == "gemma4":
+            # Gemma4 not supported by transformers. Use the gguf library
+            # to read tensor names and build the name map with gemma arch.
+            gguf_path = model_config.model
+            gguf_reader = gguf.GGUFReader(gguf_path)
+            gguf_to_hf_name_map = {}
+            for tensor in gguf_reader.tensors:
+                gguf_name_full = tensor.name
+                if "." in gguf_name_full:
+                    name, suffix = gguf_name_full.rsplit(".", 1)
+                else:
+                    name, suffix = gguf_name_full, ""
+                hf_name = name_map.get_name(name)
+                if hf_name is not None:
+                    gguf_to_hf_name_map[gguf_name_full] = f"{hf_name}.{suffix}" if suffix else hf_name
+                else:
+                    # Gemma4-specific renames that the gemma name map
+                    # doesn't know about
+                    RENAMES = {
+                        "per_layer_model_proj": "per_layer_model_projection",
+                        "per_layer_proj_norm": "per_layer_proj_norm",
+                        "per_layer_token_embd": "per_layer_token_embd",
+                        "token_embd": "model.embed_tokens",
+                        "output_norm": "model.norm",
+                        "rope_freqs": "rope_freqs",
+                    }
+                    mapped = name
+                    for old, new in RENAMES.items():
+                        mapped = mapped.replace(old, new)
+                    # Map per-layer tensors: blk.X.inp_gate → blk.X.per_layer_input_gate
+                    mapped = mapped.replace(".inp_gate", ".per_layer_input_gate")
+                    # .proj in blk context → per_layer_projection
+                    if ".proj" in mapped and ".o_proj" not in mapped:
+                        mapped = mapped.replace(".proj", ".per_layer_projection")
+                    mapped = mapped.replace(".attn_q_norm", ".self_attn.q_norm")
+                    mapped = mapped.replace(".attn_k_norm", ".self_attn.k_norm")
+                    mapped = mapped.replace(".post_attention_norm", ".post_attention_layernorm")
+                    mapped = mapped.replace(".post_ffw_norm", ".post_ffw_layernorm")
+                    gguf_to_hf_name_map[gguf_name_full] = f"{mapped}.{suffix}" if suffix else mapped
+            return gguf_to_hf_name_map
+
         # Ensure config has _name_or_path for from_config
         if not hasattr(config, '_name_or_path') or config._name_or_path is None:
             config._name_or_path = model_type
         with torch.device("meta"):
-            try:
-                dummy_model = AutoModelForCausalLM.from_config(
-                    config, trust_remote_code=True)
-            except (ValueError, AttributeError):
-                # vLLM custom models (e.g., Gemma4) — get state_dict via
-                # the VllmConfig path
-                from vllm.config import VllmConfig
-                from vllm.model_executor.models.registry import ModelRegistry
-                model_cls, _ = ModelRegistry.resolve_model_cls(
-                    config.architectures)
-                # Create minimal VllmConfig for dummy init
-                dummy_vllm_cfg = VllmConfig(
-                    model_config=model_config,
-                    cache_config=None,
-                    device_config=model_config.device_config,
-                )
-                dummy_model = model_cls(vllm_config=dummy_vllm_cfg)
+            dummy_model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=True)
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}
