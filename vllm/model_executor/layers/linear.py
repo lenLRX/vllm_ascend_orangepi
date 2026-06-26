@@ -156,6 +156,33 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # GGUF Q4_0 path: use custom kernel with NZ-converted weights
+        if hasattr(layer, '_qweight_nz') and layer._qweight_nz is not None:
+            from vllm.model_executor.layers.npu.py_npu_ops import (
+                matmul_gguf_q4_0_layer)
+            M = x.shape[0]
+            N = layer._qweight_n
+            K = layer._qweight_k
+            x_flat = x.reshape(-1).contiguous()
+            if x_flat.dtype == torch.bfloat16:
+                x_flat = x_flat.half()
+            out = torch.empty(M * N, dtype=torch.float16, device=x.device)
+            matmul_gguf_q4_0_layer(
+                get_pointer(out), get_pointer(x_flat),
+                get_pointer(layer._qweight_nz),
+                get_pointer(layer._scales),
+                M, N, K, to_npu_dtype(torch.float16),
+                get_default_stream())
+            if x.dtype == torch.bfloat16:
+                out = out.reshape(M, N).bfloat16()
+            elif x.dtype == torch.float16:
+                out = out.reshape(M, N)
+            else:
+                out = out.reshape(M, N).to(x.dtype)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         m, k = x.shape
         n, k = layer.weight.shape
 

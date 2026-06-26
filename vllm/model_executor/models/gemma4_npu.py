@@ -28,6 +28,16 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
 
 from vllm.model_executor.layers.npu.util import (get_default_stream, get_pointer,
                                                   to_npu_dtype, DataType)
+import numpy as np
+
+# Lazy imports for GGUF Q4_0 support
+_gguf_q4_0_available = False
+try:
+    from vllm.model_executor.layers.npu.py_npu_ops import (
+        matmul_gguf_q4_0_layer, convert_gguf_q4_0_qweight)
+    _gguf_q4_0_available = True
+except Exception:
+    pass
 from vllm.model_executor.layers.npu.py_npu_ops import (
     split_qkv_layer, gated_gelu_layer,
     qkv_norm_with_weight_layer, qkv_norm_no_weight_layer,
@@ -906,6 +916,67 @@ class Gemma4Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def _load_q4_0_weight(self, name: str, data: torch.Tensor):
+        """Store a GGUF Q4_0 qweight on the correct submodule and convert to NZ."""
+        # name like: model.layers.0.self_attn.q_proj.qweight
+        # Find the parent module
+        base = name.rsplit(".", 1)[0]  # model.layers.0.self_attn.q_proj
+        parent = self
+        parts = base.split(".")
+        for part in parts:
+            if part.isdigit():
+                parent = parent[int(part)]
+            else:
+                parent = getattr(parent, part)
+
+        # Store raw data as numpy on parent
+        raw_u8 = data.numpy().view('uint8')
+        parent._qweight_raw = raw_u8
+        parent._qweight_type = 2  # GGML_TYPE_Q4_0
+        # Determine N, K from the layer's expected weight shape
+        N = K = 0
+        if hasattr(parent, 'weight') and parent.weight is not None:
+            N, K = parent.weight.shape
+        elif hasattr(parent, 'output_size') and hasattr(parent, 'input_size'):
+            N, K = parent.output_size, parent.input_size
+        elif hasattr(parent, 'num_embeddings') and hasattr(parent, 'embedding_dim'):
+            # VocabParallelEmbedding: skip for now (Q6_K)
+            return
+        else:
+            return  # unknown module type, skip
+
+        # Determine if this is actually Q4_0 or something else (F16, Q6_K)
+        raw_bytes = len(raw_u8)
+        expected_f16 = N * K * 2
+        expected_q4_0 = N * K // 32 * 18
+        if raw_bytes == expected_f16:
+            # F16 weight — just load as fp16 directly
+            fp16_data = data.numpy().view(np.float16).reshape(N, K)
+            parent.weight.data = torch.from_numpy(fp16_data).to(parent.weight.device, parent.weight.dtype)
+            return
+        elif raw_bytes != expected_q4_0:
+            # Unknown format (Q6_K etc.) — skip
+            return
+
+        parent._qweight_n, parent._qweight_k = N, K
+
+    def _convert_q4_0_weights(self):
+        """Convert all stored Q4_0 weights to NZ format on NPU."""
+        if not _gguf_q4_0_available:
+            return
+        for mod in self.modules():
+            if hasattr(mod, '_qweight_raw') and not hasattr(mod, '_qweight_nz'):
+                raw = mod._qweight_raw
+                N = mod._qweight_n
+                K = mod._qweight_k
+                nz_bytes = K * N // 2
+                qw_nz = np.zeros(nz_bytes, dtype=np.uint8)
+                scales = np.zeros(K // 32 * N, dtype=np.uint16)
+                convert_gguf_q4_0_qweight(raw, qw_nz, scales, N, K)
+                mod._qweight_nz = torch.from_numpy(qw_nz).npu()
+                mod._scales = torch.from_numpy(scales.view(np.float16)).npu()
+                del mod._qweight_raw  # free CPU memory
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         use_k_eq_v = getattr(self.config, "attention_k_eq_v", False)
         k_eq_v_layer_indices = set()
@@ -958,6 +1029,14 @@ class Gemma4Model(nn.Module):
                                           "v" if shard_id == "k" else shard_id)
                 break
             else:
+                # Intercept GGUF Q4_0 weights (renamed to .qweight)
+                if name.endswith(".qweight") and _gguf_q4_0_available:
+                    self._load_q4_0_weight(name, loaded_weight)
+                    continue
+                if name.endswith(".qweight_type"):
+                    # qweight_type is handled together with qweight
+                    continue
+
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Remap checkpoint q_norm.weight -> param q_norm_weight
@@ -989,6 +1068,9 @@ class Gemma4Model(nn.Module):
                         weight_loader = getattr(param, "weight_loader",
                                                 default_weight_loader)
                         weight_loader(param, loaded_weight)
+
+        # Convert GGUF Q4_0 weights to NZ format after all weights loaded
+        self._convert_q4_0_weights()
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
