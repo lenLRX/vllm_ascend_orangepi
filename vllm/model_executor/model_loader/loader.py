@@ -1117,11 +1117,42 @@ class GGUFModelLoader(BaseModelLoader):
                 arch = key
                 break
         if arch is None:
-            raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        num_layers = config.num_hidden_layers
+            # Fallback: use gemma arch for gemma4 (similar architecture)
+            for key, value in gguf.MODEL_ARCH_NAMES.items():
+                if value == "gemma":
+                    arch = key
+                    break
+            if arch is None:
+                raise RuntimeError(f"Unknown gguf model_type: {model_type}")
+        # Gemma4 nests num_hidden_layers inside text_config
+        if hasattr(config, 'num_hidden_layers'):
+            num_layers = config.num_hidden_layers
+        elif hasattr(config, 'text_config') and config.text_config is not None:
+            num_layers = config.text_config.num_hidden_layers
+        else:
+            raise RuntimeError(f"Cannot determine num_hidden_layers for {model_type}")
         name_map = gguf.get_tensor_name_map(arch, num_layers)
+        # Ensure config has _name_or_path for from_config
+        if not hasattr(config, '_name_or_path') or config._name_or_path is None:
+            config._name_or_path = model_type
         with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
+            try:
+                dummy_model = AutoModelForCausalLM.from_config(
+                    config, trust_remote_code=True)
+            except (ValueError, AttributeError):
+                # vLLM custom models (e.g., Gemma4) — get state_dict via
+                # the VllmConfig path
+                from vllm.config import VllmConfig
+                from vllm.model_executor.models.registry import ModelRegistry
+                model_cls, _ = ModelRegistry.resolve_model_cls(
+                    config.architectures)
+                # Create minimal VllmConfig for dummy init
+                dummy_vllm_cfg = VllmConfig(
+                    model_config=model_config,
+                    cache_config=None,
+                    device_config=model_config.device_config,
+                )
+                dummy_model = model_cls(vllm_config=dummy_vllm_cfg)
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}

@@ -179,6 +179,11 @@ def get_config(
             raise ValueError(f"No supported config format found in {model}")
 
     if config_format == ConfigFormat.HF:
+        # If a config.json exists alongside the model, bypass transformers'
+        # GGUF config parser (which may not support all architectures like gemma4).
+        if is_gguf and file_or_path_exists(
+                model, HF_CONFIG_NAME, revision=revision, token=token):
+            kwargs.pop("gguf_file", None)
         config_dict, _ = PretrainedConfig.get_config_dict(
             model,
             revision=revision,
@@ -230,10 +235,14 @@ def get_config(
     # Special architecture mapping check for GGUF models
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(
-                f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
+            # If config already has architectures set (e.g., from config.json),
+            # skip the GGUF architecture mapping.
+            if not config.architectures:
+                raise RuntimeError(
+                    f"Can't get gguf config for {config.model_type}.")
+        else:
+            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            config.update({"architectures": [model_type]})
 
     patch_rope_scaling(config)
 
@@ -569,5 +578,5 @@ def try_get_generation_config(
                 revision=revision,
             )
             return GenerationConfig.from_model_config(config)
-        except OSError:  # Not found
+        except (OSError, AttributeError):  # Not found or config incompatibility
             return None
