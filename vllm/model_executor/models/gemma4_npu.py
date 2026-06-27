@@ -38,6 +38,20 @@ try:
     _gguf_q4_0_available = True
 except Exception:
     pass
+
+# Q6_K constants (super-block size for K-quant formats)
+_QK_K = 256
+_Q6_K_BLOCK_SIZE = 210  # sizeof(block_q6_K) = ql[128] + qh[64] + scales[16] + d(2)
+
+# GGML quantization type enum values
+_GGML_TYPE_F16 = 1
+_GGML_TYPE_Q4_0 = 2
+_GGML_TYPE_Q6_K = 14
+
+# Map GGUF single-projection names to NPU stacked-layer names
+_STACKED_REMAP = {"q_proj": "qkv_proj", "k_proj": "qkv_proj",
+                  "v_proj": "qkv_proj",
+                  "gate_proj": "gate_up_proj", "up_proj": "gate_up_proj"}
 from vllm.model_executor.layers.npu.py_npu_ops import (
     split_qkv_layer, gated_gelu_layer,
     qkv_norm_with_weight_layer, qkv_norm_no_weight_layer,
@@ -916,66 +930,203 @@ class Gemma4Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def _load_q4_0_weight(self, name: str, data: torch.Tensor):
-        """Store a GGUF Q4_0 qweight on the correct submodule and convert to NZ."""
-        # name like: model.layers.0.self_attn.q_proj.qweight
-        # Find the parent module
-        base = name.rsplit(".", 1)[0]  # model.layers.0.self_attn.q_proj
+    def _load_gguf_quant_weight(self, name: str, data: torch.Tensor):
+        """Store/process a GGUF quantized weight (Q4_0, Q6_K, F16)."""
+        base = name.rsplit(".", 1)[0]  # e.g., "layers.0.self_attn.q_proj"
         parent = self
-        parts = base.split(".")
-        for part in parts:
+        for part in base.split("."):
             if part.isdigit():
                 parent = parent[int(part)]
             else:
-                parent = getattr(parent, part)
+                real_part = _STACKED_REMAP.get(part, part)
+                parent = getattr(parent, real_part)
 
-        # Store raw data as numpy on parent
         raw_u8 = data.numpy().view('uint8')
-        parent._qweight_raw = raw_u8
-        parent._qweight_type = 2  # GGML_TYPE_Q4_0
-        # Determine N, K from the layer's expected weight shape
+        # The gguf library reshapes quantized tensors to a byte-shape
+        # (e.g., [N, bytes_per_row]); the C++ converter expects a flat 1D array.
+        if raw_u8.ndim != 1:
+            raw_u8 = raw_u8.ravel()
+        raw_len = raw_u8.size  # total number of uint8 elements
+        qtype = getattr(parent, '_qweight_type', 0)
+
+        # Determine the shard ID for stacked layers (qkv_proj, gate_up_proj).
+        # The GGUF tensors use individual projection names (q_proj, k_proj, …)
+        # that were remapped to the stacked module (_STACKED_REMAP above).
+        # Extract the original name to know which shard this is.
+        shard_id = None
+        orig_last = name.rsplit(".", 2)[-2]  # e.g., "q_proj" from "q_proj.qweight"
+        if orig_last in ("q_proj", "k_proj", "v_proj"):
+            shard_id = {"q_proj": "q", "k_proj": "k", "v_proj": "v"}[orig_last]
+        elif orig_last in ("gate_proj", "up_proj"):
+            shard_id = {"gate_proj": 0, "up_proj": 1}[orig_last]
+
+        # Determine N, K from the layer's expected weight shape.
+        # For stacked layers (qkv_proj, gate_up_proj), the shard's N and K
+        # differ from the combined parent weight shape.
         N = K = 0
-        if hasattr(parent, 'weight') and parent.weight is not None:
-            N, K = parent.weight.shape
-        elif hasattr(parent, 'output_size') and hasattr(parent, 'input_size'):
-            N, K = parent.output_size, parent.input_size
-        elif hasattr(parent, 'num_embeddings') and hasattr(parent, 'embedding_dim'):
-            # VocabParallelEmbedding: skip for now (Q6_K)
-            return
+        is_stacked = shard_id is not None
+        if is_stacked:
+            # N = raw_data_bytes * 32 / (18 * K);  K = hidden_size from parent
+            if hasattr(parent, 'weight') and parent.weight is not None:
+                K = parent.weight.shape[-1]  # hidden_size, shared by all shards
+            elif hasattr(parent, 'output_size') and hasattr(parent, 'input_size'):
+                K = parent.input_size
+            if K > 0:
+                N = raw_len * 32 // (18 * K)
         else:
-            return  # unknown module type, skip
+            if hasattr(parent, 'weight') and parent.weight is not None:
+                N, K = parent.weight.shape
+            elif hasattr(parent, 'output_size') and hasattr(parent, 'input_size'):
+                N, K = parent.output_size, parent.input_size
+            elif hasattr(parent, 'num_embeddings') and hasattr(parent, 'embedding_dim'):
+                N, K = parent.num_embeddings, parent.embedding_dim
+            else:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "GGUF: skipping %s — no weight shape on parent %s",
+                    name, type(parent).__name__)
+                return
 
-        # Determine if this is actually Q4_0 or something else (F16, Q6_K)
-        raw_bytes = len(raw_u8)
+        # Q6_K dequantization (token_embd, per_layer_token_embd)
+        if qtype == _GGML_TYPE_Q6_K:
+            self._dequant_q6_k_and_load(parent, data, raw_u8, N, K)
+            return
+
+        # F16: direct load (weights stored as raw fp16)
         expected_f16 = N * K * 2
-        expected_q4_0 = N * K // 32 * 18
-        if raw_bytes == expected_f16:
-            # F16 weight — just load as fp16 directly
+        if raw_len == expected_f16:
             fp16_data = data.numpy().view(np.float16).reshape(N, K)
-            parent.weight.data = torch.from_numpy(fp16_data).to(parent.weight.device, parent.weight.dtype)
-            return
-        elif raw_bytes != expected_q4_0:
-            # Unknown format (Q6_K etc.) — skip
+            parent.weight.data = torch.from_numpy(
+                fp16_data).to(parent.weight.device, parent.weight.dtype)
             return
 
-        parent._qweight_n, parent._qweight_k = N, K
+        # Q4_0: store raw data for later NZ conversion.
+        # For stacked layers (qkv_proj, gate_up_proj), store per-shard so the
+        # matmul kernel can be called independently for each shard.
+        expected_q4_0 = N * K // 32 * 18
+        if raw_len == expected_q4_0:
+            if shard_id is not None:
+                if not hasattr(parent, '_qweight_raw_shards'):
+                    parent._qweight_raw_shards = {}
+                    parent._qweight_shard_n = {}
+                    parent._qweight_shard_k = {}
+                parent._qweight_raw_shards[shard_id] = raw_u8
+                parent._qweight_shard_n[shard_id] = N
+                parent._qweight_shard_k[shard_id] = K
+            else:
+                parent._qweight_raw = raw_u8
+                parent._qweight_n, parent._qweight_k = N, K
+            return
+
+        # Unknown format — skip
+        import logging
+        logging.getLogger(__name__).warning(
+            "GGUF: unknown quant format for %s: len=%d, N=%d, K=%d, "
+            "expected_f16=%d, expected_q4_0=%d, qtype=%d",
+            name, raw_len, N, K, expected_f16, expected_q4_0, qtype)
+
+    def _dequant_q6_k_and_load(self, parent, data, raw_u8, N, K):
+        """Dequantize Q6_K tensor and load as fp16 weight."""
+        import gguf as _gguf
+
+        # The gguf library has already reshaped the raw tensor data to
+        # the byte shape: (outer_dim, inner_dim // 256 * 210).
+        # gguf.dequantize() expects exactly this byte-shape tensor.
+        # After dequant: float32 with shape (outer_dim, inner_dim)
+        # which is directly the vLLM weight shape since the gguf library
+        # reversed the dimensions for us.
+        dequant_f32 = _gguf.dequantize(data.numpy(), _gguf.GGMLQuantizationType.Q6_K)
+
+        # Convert to fp16 and load
+        fp16_data = dequant_f32.astype(np.float16)
+        if hasattr(parent, 'weight') and parent.weight is not None:
+            parent.weight.data = torch.from_numpy(
+                fp16_data).to(parent.weight.device, parent.weight.dtype)
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                "GGUF: no .weight on %s for Q6_K dequant", type(parent).__name__)
 
     def _convert_q4_0_weights(self):
         """Convert all stored Q4_0 weights to NZ format on NPU."""
         if not _gguf_q4_0_available:
             return
         for mod in self.modules():
+            # Handle sharded Q4_0 (qkv_proj, gate_up_proj)
+            if hasattr(mod, '_qweight_raw_shards') and not hasattr(mod, '_qweight_nz_shards'):
+                mod._qweight_nz_shards = {}
+                mod._scales_shards = {}
+                mod._qweight_shard_n = {}
+                mod._qweight_shard_k = {}
+                # Validate that N and K were stored for each shard before
+                # conversion.  (k_eq_v layers may lack k/v shards.)
+                valid_shards = {}
+                for sid in list(mod._qweight_raw_shards.keys()):
+                    if sid not in mod._qweight_shard_n:
+                        continue
+                    N = int(mod._qweight_shard_n.get(sid, 0))
+                    K = int(mod._qweight_shard_k.get(sid, 0))
+                    if N <= 0 or K <= 0:
+                        continue
+                    valid_shards[sid] = (N, K, mod._qweight_raw_shards[sid])
+                for sid, (N, K, raw) in valid_shards.items():
+                    nz_bytes = K * N // 2
+                    qw_nz = np.zeros(nz_bytes, dtype=np.uint8)
+                    scales = np.zeros(K // 32 * N, dtype=np.uint16)
+                    convert_gguf_q4_0_qweight(raw, qw_nz, scales, N, K)
+                    mod._qweight_nz_shards[sid] = torch.from_numpy(
+                        qw_nz.ravel()).npu()
+                    mod._scales_shards[sid] = torch.from_numpy(
+                        scales.ravel().view(np.float16)).npu()
+                    mod._qweight_shard_n[sid] = N
+                    mod._qweight_shard_k[sid] = K
+                del mod._qweight_raw_shards
+
+            # Handle unsharded Q4_0 (down_proj, o_proj, etc.)
             if hasattr(mod, '_qweight_raw') and not hasattr(mod, '_qweight_nz'):
                 raw = mod._qweight_raw
                 N = mod._qweight_n
                 K = mod._qweight_k
-                nz_bytes = K * N // 2
+                if N <= 0 or K <= 0:
+                    del mod._qweight_raw
+                    continue
+                nz_bytes = int(K) * int(N) // 2
                 qw_nz = np.zeros(nz_bytes, dtype=np.uint8)
-                scales = np.zeros(K // 32 * N, dtype=np.uint16)
-                convert_gguf_q4_0_qweight(raw, qw_nz, scales, N, K)
-                mod._qweight_nz = torch.from_numpy(qw_nz).npu()
-                mod._scales = torch.from_numpy(scales.view(np.float16)).npu()
+                scales = np.zeros(int(K) // 32 * int(N), dtype=np.uint16)
+                convert_gguf_q4_0_qweight(raw, qw_nz, scales, int(N), int(K))
+                mod._qweight_nz = torch.from_numpy(qw_nz.ravel()).npu()
+                mod._scales = torch.from_numpy(
+                    scales.ravel().view(np.float16)).npu()
                 del mod._qweight_raw  # free CPU memory
+
+    def _post_load_process_weights(self):
+        """Call process_weights_after_loading on non-Q4_0 modules.
+
+        The GGUF loader does not call process_weights_after_loading, but NPU
+        linear methods and embedding methods need it to transpose weights to NZ
+        format.  Skip Q4_0 layers (they have _qweight_nz and use a custom kernel).
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        for name, mod in self.named_modules():
+            # Check both linear layers (quant_method) and embeddings (linear_method)
+            meth = getattr(mod, 'quant_method', None) or getattr(mod, 'linear_method', None)
+            if meth is None:
+                continue
+            # Skip Q4_0 layers — they use a custom kernel via _qweight_nz or _qweight_nz_shards
+            if hasattr(mod, '_qweight_nz') or hasattr(mod, '_qweight_nz_shards'):
+                continue
+            # Skip if the process method doesn't exist
+            process_fn = getattr(meth, 'process_weights_after_loading', None)
+            if process_fn is None:
+                continue
+            # Only process if weight was actually loaded
+            if hasattr(mod, 'weight') and mod.weight is not None:
+                if mod.weight.numel() == 0:
+                    continue
+                _log.debug("GGUF post-load process: %s (%s)", name,
+                           type(meth).__name__)
+                process_fn(mod)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         use_k_eq_v = getattr(self.config, "attention_k_eq_v", False)
@@ -1007,6 +1158,32 @@ class Gemma4Model(nn.Module):
                 if m and int(m.group(1)) in k_eq_v_layer_indices:
                     v_name = name.replace("k_proj", "v_proj")
 
+            # Intercept GGUF quantized weights BEFORE stacked_params_mapping.
+            # qweight_type tells us the GGML quantization type; qweight is the
+            # raw quantized data.  These must be handled before the
+            # stacked_params_mapping below, which would incorrectly remap
+            # e.g. q_proj.qweight → qkv_proj.qweight (a name that doesn't
+            # exist in params_dict).
+            if name.endswith(".qweight_type"):
+                # Store type on the parent module for use when processing qweight.
+                # Apply _STACKED_REMAP to resolve stacked modules (qkv_proj, gate_up_proj).
+                base = name.replace(".qweight_type", "")
+                parent = self
+                for part in base.split("."):
+                    if part.isdigit():
+                        parent = parent[int(part)]
+                    else:
+                        real_part = _STACKED_REMAP.get(part, part)
+                        parent = getattr(parent, real_part, None)
+                        if parent is None:
+                            break
+                if parent is not None:
+                    parent._qweight_type = int(loaded_weight.item())
+                continue
+            if name.endswith(".qweight") and _gguf_q4_0_available:
+                self._load_gguf_quant_weight(name, loaded_weight)
+                continue
+
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1029,13 +1206,7 @@ class Gemma4Model(nn.Module):
                                           "v" if shard_id == "k" else shard_id)
                 break
             else:
-                # Intercept GGUF Q4_0 weights (renamed to .qweight)
-                if name.endswith(".qweight") and _gguf_q4_0_available:
-                    self._load_q4_0_weight(name, loaded_weight)
-                    continue
-                if name.endswith(".qweight_type"):
-                    # qweight_type is handled together with qweight
-                    continue
+                # Names not matching any stacked param (norms, buffers, etc.)
 
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1071,6 +1242,11 @@ class Gemma4Model(nn.Module):
 
         # Convert GGUF Q4_0 weights to NZ format after all weights loaded
         self._convert_q4_0_weights()
+
+        # Post-load: call process_weights_after_loading on non-Q4_0 modules.
+        # The GGUF loader doesn't call this automatically, but NPU linear/embedding
+        # methods need it to transpose weights to NZ format for matmul_nz_layer.
+        self._post_load_process_weights()
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
@@ -1118,6 +1294,12 @@ class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         config = _get_text_config(raw_config)
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
+
+        # For GGUF models on NPU, force UnquantizedLinearMethod / UnquantizedEmbeddingMethod.
+        # Quantization is handled in Gemma4Model.load_weights (_load_gguf_quant_weight).
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            vllm_config.quant_config = None
+            quant_config = None
 
         self.config = config
         self.lora_config = lora_config

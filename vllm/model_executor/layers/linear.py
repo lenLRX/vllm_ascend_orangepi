@@ -156,7 +156,47 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # GGUF Q4_0 path: use custom kernel with NZ-converted weights
+        # GGUF Q4_0 path: use custom kernel with NZ-converted weights.
+        # Supports both single Q4_0 weights (_qweight_nz) and stacked
+        # Q4_0 weights (_qweight_nz_shards, used for qkv_proj / gate_up_proj).
+        if hasattr(layer, '_qweight_nz_shards') and layer._qweight_nz_shards:
+            from vllm.model_executor.layers.npu.py_npu_ops import (
+                matmul_gguf_q4_0_layer)
+            M = x.shape[0]
+            K = x.shape[-1]  # hidden_size, same for all shards
+            x_flat = x.reshape(-1).contiguous()
+            if x_flat.dtype == torch.bfloat16:
+                x_flat = x_flat.half()
+            target_dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else (
+                torch.float16 if x.dtype == torch.float16 else x.dtype)
+            shard_outputs = []
+            # Shards are ordered: q, k, v for qkv_proj; gate(0), up(1) for gate_up_proj
+            shard_order = (["q", "k", "v"] if any(
+                k in layer._qweight_nz_shards for k in ("q", "k", "v"))
+                else [0, 1])
+            for sid in shard_order:
+                if sid not in layer._qweight_nz_shards:
+                    continue
+                N = layer._qweight_shard_n[sid]
+                out_shard = torch.empty(M * N, dtype=torch.float16, device=x.device)
+                matmul_gguf_q4_0_layer(
+                    get_pointer(out_shard), get_pointer(x_flat),
+                    get_pointer(layer._qweight_nz_shards[sid]),
+                    get_pointer(layer._scales_shards[sid]),
+                    M, N, K, to_npu_dtype(torch.float16),
+                    get_default_stream())
+                if target_dtype == torch.bfloat16:
+                    out_shard = out_shard.reshape(M, N).bfloat16()
+                elif target_dtype == torch.float16:
+                    out_shard = out_shard.reshape(M, N)
+                else:
+                    out_shard = out_shard.reshape(M, N).to(target_dtype)
+                shard_outputs.append(out_shard)
+            out = torch.cat(shard_outputs, dim=-1)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         if hasattr(layer, '_qweight_nz') and layer._qweight_nz is not None:
             from vllm.model_executor.layers.npu.py_npu_ops import (
                 matmul_gguf_q4_0_layer)
