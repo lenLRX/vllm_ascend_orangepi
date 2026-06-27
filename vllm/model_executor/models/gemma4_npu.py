@@ -63,6 +63,43 @@ from vllm.model_executor.layers.npu.py_npu_ops import (
 import acl
 
 
+def _f32_to_fp16_bits(val):
+    """Convert float32 scalar to fp16 bit pattern (uint16)."""
+    return np.array([val], dtype=np.float16).view(np.uint16)[0]
+
+
+def _quantize_f32_to_q4_0(W_f32):
+    """Quantize float32 weight [N, K] to Q4_0 GGUF interleaved format.
+
+    Returns a flat 1D uint8 array of N * K // 32 * 18 bytes.
+    """
+    N, K = W_f32.shape
+    assert K % 32 == 0
+    k_blocks = K // 32
+    total_blocks = N * k_blocks
+    gguf = np.zeros(total_blocks * 18, dtype=np.uint8)
+    for n_i in range(N):
+        for kb in range(k_blocks):
+            block = n_i * k_blocks + kb
+            k_start = kb * 32
+            w_block = W_f32[n_i, k_start:k_start + 32]
+            max_abs = np.max(np.abs(w_block))
+            if max_abs < 1e-8:
+                d_fp16 = 0
+                nibbles = np.zeros(32, dtype=np.uint8)
+            else:
+                d = max_abs / 7.0
+                d_fp16 = _f32_to_fp16_bits(d)
+                q_vals = np.clip(np.round(w_block / d), -8, 7).astype(np.int32) + 8
+                nibbles = q_vals.astype(np.uint8)
+            offset = block * 18
+            gguf[offset] = d_fp16 & 0xFF
+            gguf[offset + 1] = (d_fp16 >> 8) & 0xFF
+            for j in range(16):
+                gguf[offset + 2 + j] = nibbles[j] | (nibbles[j + 16] << 4)
+    return gguf
+
+
 def _get_text_config(config):
     if hasattr(config, "text_config"):
         return config.text_config
@@ -1099,6 +1136,119 @@ class Gemma4Model(nn.Module):
                     scales.ravel().view(np.float16)).npu()
                 del mod._qweight_raw  # free CPU memory
 
+    def _inject_missing_kv_weights(self):
+        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF.
+
+        The GGUF quantizer removed k_proj and v_proj for KV-shared layers
+        (layers 15-34 where num_kv_shared_layers=20).  These layers still need
+        k/v projections for their own attention computation (they just don't
+        write the result to the KV cache).  We load the k_proj weight from the
+        bf16 model, quantize it to Q4_0, and duplicate it as v_proj (k==v for
+        these layers).
+        """
+        import os, glob
+        from safetensors import safe_open
+
+        bf16_dir = '/ssd/models/gemma-4-E2B-it'
+        if not os.path.isdir(bf16_dir):
+            import logging
+            logging.getLogger(__name__).warning(
+                "GGUF: bf16 model not found at %s, cannot inject missing k/v",
+                bf16_dir)
+            return
+
+        num_kv_shared = getattr(self.config, "num_kv_shared_layers", 0)
+        if num_kv_shared <= 0:
+            return
+        first_kv_shared = self.config.num_hidden_layers - num_kv_shared
+
+        safetensor_files = sorted(glob.glob(os.path.join(bf16_dir, '*.safetensors')))
+        if not safetensor_files:
+            return
+
+        # Pre-load all k_proj AND v_proj weights from the bf16 model
+        needed_k_weights = {}
+        needed_v_weights = {}
+        for f in safetensor_files:
+            with safe_open(f, framework='pt') as sf:
+                for key in sf.keys():
+                    if 'self_attn.k_proj.weight' in key:
+                        parts = key.split('.')
+                        if 'layers' in parts:
+                            idx = int(parts[parts.index('layers') + 1])
+                            if idx >= first_kv_shared:
+                                needed_k_weights[idx] = sf.get_tensor(key)
+                    elif 'self_attn.v_proj.weight' in key:
+                        parts = key.split('.')
+                        if 'layers' in parts:
+                            idx = int(parts[parts.index('layers') + 1])
+                            if idx >= first_kv_shared:
+                                needed_v_weights[idx] = sf.get_tensor(key)
+
+        import logging
+        _log = logging.getLogger(__name__)
+        injected = 0
+        for idx in range(first_kv_shared, self.config.num_hidden_layers):
+            if idx >= len(self.layers):
+                break
+            layer = self.layers[idx]
+            qkv = layer.self_attn.qkv_proj
+
+            # Skip if k shard already exists
+            if hasattr(qkv, '_qweight_nz_shards') and 'k' in qkv._qweight_nz_shards:
+                continue
+
+            k_tensor = needed_k_weights.get(idx)
+            v_tensor = needed_v_weights.get(idx)
+            if k_tensor is None or v_tensor is None:
+                _log.warning("GGUF: layer %d k/v not found in bf16 model", idx)
+                continue
+
+            # Quantize and convert k_proj
+            k_f32 = k_tensor.float().numpy()
+            Nk, K = k_f32.shape
+            gguf_k = _quantize_f32_to_q4_0(k_f32)
+            nz_k = np.zeros(K * Nk // 2, dtype=np.uint8)
+            sc_k = np.zeros(K // 32 * Nk, dtype=np.uint16)
+            convert_gguf_q4_0_qweight(gguf_k, nz_k, sc_k, Nk, K)
+
+            # Quantize and convert v_proj
+            v_f32 = v_tensor.float().numpy()
+            Nv, Kv = v_f32.shape
+            gguf_v = _quantize_f32_to_q4_0(v_f32)
+            nz_v = np.zeros(Kv * Nv // 2, dtype=np.uint8)
+            sc_v = np.zeros(Kv // 32 * Nv, dtype=np.uint16)
+            convert_gguf_q4_0_qweight(gguf_v, nz_v, sc_v, Nv, Kv)
+
+            # Initialize shard dicts if not already present
+            if not hasattr(qkv, '_qweight_nz_shards'):
+                qkv._qweight_nz_shards = {}
+                qkv._scales_shards = {}
+                qkv._qweight_shard_n = {}
+                qkv._qweight_shard_k = {}
+
+            # Store k shard
+            qkv._qweight_nz_shards['k'] = torch.from_numpy(nz_k.ravel()).npu()
+            qkv._scales_shards['k'] = torch.from_numpy(
+                sc_k.ravel().view(np.float16)).npu()
+            qkv._qweight_shard_n['k'] = Nk
+            qkv._qweight_shard_k['k'] = K
+
+            # Store v shard
+            qkv._qweight_nz_shards['v'] = torch.from_numpy(nz_v.ravel()).npu()
+            qkv._scales_shards['v'] = torch.from_numpy(
+                sc_v.ravel().view(np.float16)).npu()
+            qkv._qweight_shard_n['v'] = Nv
+            qkv._qweight_shard_k['v'] = Kv
+
+            injected += 1
+            _log.debug("GGUF: injected k/v Q4_0 for layer %d (Nk=%d Nv=%d K=%d)",
+                       idx, Nk, Nv, K)
+
+        if injected > 0:
+            _log.info("GGUF: injected missing k/v Q4_0 for %d layers from bf16 model",
+                      injected)
+
     def _post_load_process_weights(self):
         """Call process_weights_after_loading on non-Q4_0 modules.
 
@@ -1109,8 +1259,12 @@ class Gemma4Model(nn.Module):
         import logging
         _log = logging.getLogger(__name__)
         for name, mod in self.named_modules():
-            # Check both linear layers (quant_method) and embeddings (linear_method)
-            meth = getattr(mod, 'quant_method', None) or getattr(mod, 'linear_method', None)
+            # Only process LinearBase subclasses (ReplicatedLinear, etc.) —
+            # NOT VocabParallelEmbedding.  Embeddings use layer.weight directly
+            # in standard format; transposing them would break the lm_head apply()
+            # path (which reads k from the transposed shape and tries to reshape
+            # hidden_states incorrectly).
+            meth = getattr(mod, 'quant_method', None)
             if meth is None:
                 continue
             # Skip Q4_0 layers — they use a custom kernel via _qweight_nz or _qweight_nz_shards
@@ -1242,6 +1396,9 @@ class Gemma4Model(nn.Module):
 
         # Convert GGUF Q4_0 weights to NZ format after all weights loaded
         self._convert_q4_0_weights()
+
+        # Inject missing k/v Q4_0 weights for KV-shared layers (15-34) from bf16 model
+        self._inject_missing_kv_weights()
 
         # Post-load: call process_weights_after_loading on non-Q4_0 modules.
         # The GGUF loader doesn't call this automatically, but NPU linear/embedding
