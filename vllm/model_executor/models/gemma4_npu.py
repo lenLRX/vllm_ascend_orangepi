@@ -68,6 +68,14 @@ def _f32_to_fp16_bits(val):
     return np.array([val], dtype=np.float16).view(np.uint16)[0]
 
 
+def _dump_npu_tensor(tensor, filepath):
+    """Save an NPU tensor as .npy file for comparison."""
+    import os
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    cpu = tensor.cpu().float().numpy()
+    np.save(filepath, cpu)
+
+
 def _quantize_f32_to_q4_0(W_f32):
     """Quantize float32 weight [N, K] to Q4_0 GGUF interleaved format.
 
@@ -889,6 +897,9 @@ class Gemma4Model(nn.Module):
                     hidden_states, per_layer_inputs)
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
+                # Dump initial embeddings (layer -1) if enabled
+                if getattr(self, '_dump_tensors', False):
+                    _dump_npu_tensor(hidden_states, "/tmp/npu_dump/layer_-1.npy")
                 per_layer_embeds = self.get_per_layer_inputs(input_ids)
                 per_layer_inputs = self.project_per_layer_inputs(
                     hidden_states, per_layer_embeds)
@@ -951,6 +962,11 @@ class Gemma4Model(nn.Module):
                 residual,
                 per_layer_input=layer_per_input,
             )
+            # Dump layer output hidden states if enabled
+            if getattr(self, '_dump_tensors', False):
+                acl.rt.synchronize_stream(get_default_stream())
+                _dump_npu_tensor(hidden_states,
+                                 f"/tmp/npu_dump/layer_{i:02d}.npy")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -1137,15 +1153,7 @@ class Gemma4Model(nn.Module):
                 del mod._qweight_raw  # free CPU memory
 
     def _inject_missing_kv_weights(self):
-        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF.
-
-        The GGUF quantizer removed k_proj and v_proj for KV-shared layers
-        (layers 15-34 where num_kv_shared_layers=20).  These layers still need
-        k/v projections for their own attention computation (they just don't
-        write the result to the KV cache).  We load the k_proj weight from the
-        bf16 model, quantize it to Q4_0, and duplicate it as v_proj (k==v for
-        these layers).
-        """
+        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF."""
         import os, glob
         from safetensors import safe_open
 
@@ -1394,16 +1402,22 @@ class Gemma4Model(nn.Module):
                                                 default_weight_loader)
                         weight_loader(param, loaded_weight)
 
-        # Convert GGUF Q4_0 weights to NZ format after all weights loaded
-        self._convert_q4_0_weights()
+        # Post-load steps — only for GGUF loads.
+        # Detect GGUF load by checking for _qweight_raw on any module.
+        _is_gguf = any(hasattr(m, '_qweight_raw') or hasattr(m, '_qweight_raw_shards')
+                       for m in self.modules())
 
-        # Inject missing k/v Q4_0 weights for KV-shared layers (15-34) from bf16 model
-        self._inject_missing_kv_weights()
+        if _is_gguf:
+            # Convert GGUF Q4_0 weights to NZ format
+            self._convert_q4_0_weights()
 
-        # Post-load: call process_weights_after_loading on non-Q4_0 modules.
-        # The GGUF loader doesn't call this automatically, but NPU linear/embedding
-        # methods need it to transpose weights to NZ format for matmul_nz_layer.
-        self._post_load_process_weights()
+            # Inject missing k/v for KV-shared layers (15-34) from bf16 model
+            self._inject_missing_kv_weights()
+
+            # Post-load: transpose non-Q4_0 weights to NZ format.
+            # The GGUF loader doesn't call process_weights_after_loading,
+            # but NPU linear methods need NZ-transposed weights.
+            self._post_load_process_weights()
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
