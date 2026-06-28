@@ -178,6 +178,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 if sid not in layer._qweight_nz_shards:
                     continue
                 N = layer._qweight_shard_n[sid]
+                N = layer._qweight_shard_n[sid]
                 out_shard = torch.empty(M * N, dtype=torch.float16, device=x.device)
                 matmul_gguf_q4_0_layer(
                     get_pointer(out_shard), get_pointer(x_flat),

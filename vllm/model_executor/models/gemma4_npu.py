@@ -1109,8 +1109,8 @@ class Gemma4Model(nn.Module):
             if hasattr(mod, '_qweight_raw_shards') and not hasattr(mod, '_qweight_nz_shards'):
                 mod._qweight_nz_shards = {}
                 mod._scales_shards = {}
-                mod._qweight_shard_n = {}
-                mod._qweight_shard_k = {}
+                # NOTE: _qweight_shard_n and _qweight_shard_k were already
+                # populated in _load_gguf_quant_weight — do NOT overwrite!
                 # Validate that N and K were stored for each shard before
                 # conversion.  (k_eq_v layers may lack k/v shards.)
                 valid_shards = {}
