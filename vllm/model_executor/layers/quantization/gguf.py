@@ -1,9 +1,34 @@
 from typing import Any, Dict, List, Optional
 
-import gguf
 import numpy as np
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
+
+# GGML quant size table (block_size, type_size_bytes), keyed by GGML type id.
+# Mirrored from vllm.model_executor.model_loader.gguf_reader to avoid a circular
+# import through the model_loader package. GGML format constants (stable).
+_GGML_QUANT_SIZES = {
+    0: (1, 4),    # F32
+    1: (1, 2),    # F16
+    2: (32, 18),  # Q4_0
+    3: (32, 20),  # Q4_1
+    6: (32, 22),  # Q5_0
+    7: (32, 24),  # Q5_1
+    8: (32, 34),  # Q8_0
+    9: (32, 36),  # Q8_1
+    10: (256, 84),   # Q2_K
+    11: (256, 110),  # Q3_K
+    12: (256, 144),  # Q4_K
+    13: (256, 176),  # Q5_K
+    14: (256, 210),  # Q6_K
+    15: (256, 292),  # Q8_K
+    24: (1, 1),    # I8
+    25: (1, 2),    # I16
+    26: (1, 4),    # I32
+    27: (1, 8),    # I64
+    28: (1, 8),    # F64
+    30: (1, 2),    # BF16
+}
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
@@ -144,7 +169,7 @@ def _fuse_mul_mat(x: torch.Tensor, qweight: torch.Tensor,
     if x.shape[0] == 1:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     elif qweight_type >= 16:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        block_size, type_size = _GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         weight = ops.ggml_dequantize(qweight, qweight_type, *shape)
         y = x @ weight.T
@@ -248,7 +273,7 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         qweight = layer.qweight
         qweight_type = layer.qweight_type.weight_type
 
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        block_size, type_size = _GGML_QUANT_SIZES[qweight_type]
         hidden_size = qweight.shape[1] // type_size * block_size
         if qweight_type < 2:
             return torch.embedding(qweight, x)

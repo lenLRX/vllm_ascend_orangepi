@@ -1,4 +1,5 @@
 """Gemma4 model implementation for Davinci NPU."""
+import os
 import re
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -47,6 +48,62 @@ _Q6_K_BLOCK_SIZE = 210  # sizeof(block_q6_K) = ql[128] + qh[64] + scales[16] + d
 _GGML_TYPE_F16 = 1
 _GGML_TYPE_Q4_0 = 2
 _GGML_TYPE_Q6_K = 14
+
+
+def _dequant_q6_k(data_bytes, out_dtype=np.float16):
+    """Dequantize GGUF Q6_K bytes -> ``out_dtype`` (default fp16).
+
+    Drop-in replacement for ``gguf.dequantize(data, GGMLQuantizationType.Q6_K)``
+    (which returns float32; here we emit fp16 directly since the only caller
+    immediately casts to fp16 - the per-element f32->f16 rounding is identical
+    whether done per-chunk or on the whole array).
+
+    ``data_bytes`` is the byte-shaped numpy view (outer_dim, inner_dim // 256
+    * 210) produced by the GGUF reader. Returns shape (outer_dim, inner_dim).
+
+    Processes in 16-row chunks to bound peak memory (the largest tensor,
+    per_layer_token_embd, dequantizes to ~9 GB of f32 otherwise).
+
+    Bit-exact replica of the upstream Q6_K.dequantize_blocks algorithm:
+    ql/qh nibble unpack + scale*d, super-block = 256 elems / 210 bytes.
+    """
+    QK_K = _QK_K
+    TYPE_SIZE = _Q6_K_BLOCK_SIZE
+    rows = np.asarray(data_bytes)
+    orig_shape = rows.shape
+    rows = rows.reshape((-1, rows.shape[-1]))
+    n_rows = rows.shape[0]
+    blocks_per_row = rows.shape[1] // TYPE_SIZE
+    out_inner = blocks_per_row * QK_K
+    out = np.empty((n_rows, out_inner), dtype=out_dtype)
+    # Broadcast constants for the nibble unpack (see Q6_K.dequantize_blocks).
+    _sh_lo = np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2, 1))
+    _sh_hi = np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+    _mask_lo = np.uint8(0x0F)
+    _mask_hi = np.uint8(0x03)
+    _shift4 = np.uint8(4)
+    CHUNK = 16  # matches upstream _apply_over_grouped_rows group size
+    for start in range(0, n_rows, CHUNK):
+        chunk = rows[start:start + CHUNK]
+        cr = chunk.shape[0]
+        blocks = chunk.reshape(-1, TYPE_SIZE)
+        nb = blocks.shape[0]
+        ql, rest = np.hsplit(blocks, [QK_K // 2])        # 128 bytes
+        qh, rest = np.hsplit(rest, [QK_K // 4])           # 64 bytes
+        scales, d = np.hsplit(rest, [QK_K // 16])        # 16 + 2 bytes
+        scales = scales.view(np.int8).astype(np.float32)
+        d = d.view(np.float16).astype(np.float32)
+        d = (d * scales).reshape((nb, QK_K // 16, 1))
+        ql = ql.reshape((nb, -1, 1, 64)) >> _sh_lo
+        ql = (ql & _mask_lo).reshape((nb, -1, 32))
+        qh = qh.reshape((nb, -1, 1, 32)) >> _sh_hi
+        qh = (qh & _mask_hi).reshape((nb, -1, 32))
+        q = (ql | (qh << _shift4)).astype(np.int8) - np.int8(32)
+        q = q.reshape((nb, QK_K // 16, -1)).astype(np.float32)
+        deq = (d * q).reshape((nb, QK_K))
+        out[start:start + cr] = deq.reshape((cr, out_inner)).astype(
+            out_dtype, copy=False)
+    return out.reshape((*orig_shape[:-1], out_inner))
 
 # Map GGUF single-projection names to NPU stacked-layer names
 _STACKED_REMAP = {"q_proj": "qkv_proj", "k_proj": "qkv_proj",
@@ -416,11 +473,13 @@ class Gemma4Attention(nn.Module):
 
             token_offset += seq_len
 
+
         if not self.is_kv_shared_layer:
             q = q_roped_flat
             k_out = k_roped_flat
             v_out = v_normed.reshape(token_num, self.kv_size)
             self._should_write_kv = True
+                _dump_npu_tensor(v_out, "/tmp/dbg/l0_v_normed.npy")
         else:
             q = q_roped_flat
             # KV-shared layers: K/V come from the shared cache (filled by L13/L14).
@@ -514,6 +573,7 @@ class Gemma4Attention(nn.Module):
 
         if page_table_tensors:
             torch.npu.synchronize()
+
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -698,6 +758,7 @@ class Gemma4DecoderLayer(nn.Module):
                       hidden_states.numel(), to_npu_dtype(hidden_states.dtype),
                       get_default_stream())
             hidden_states = new_hidden
+
 
         # Layer scalar multiplication.  _layer_scalar_f is a Python float set at
         # load time (see Gemma4Model.load_weights; defaults to 1.0 = no-op scale
@@ -1079,19 +1140,10 @@ class Gemma4Model(nn.Module):
             name, raw_len, N, K, expected_f16, expected_q4_0, qtype)
 
     def _dequant_q6_k_and_load(self, parent, data, raw_u8, N, K):
-        """Dequantize Q6_K tensor and load as fp16 weight."""
-        import gguf as _gguf
-
-        # The gguf library has already reshaped the raw tensor data to
-        # the byte shape: (outer_dim, inner_dim // 256 * 210).
-        # gguf.dequantize() expects exactly this byte-shape tensor.
-        # After dequant: float32 with shape (outer_dim, inner_dim)
-        # which is directly the vLLM weight shape since the gguf library
-        # reversed the dimensions for us.
-        dequant_f32 = _gguf.dequantize(data.numpy(), _gguf.GGMLQuantizationType.Q6_K)
-
-        # Convert to fp16 and load
-        fp16_data = dequant_f32.astype(np.float16)
+        """Dequantize Q6_K tensor and load as fp16 weight (no gguf library)."""
+        # data is the byte-shaped numpy view (outer_dim, inner_dim // 256 * 210)
+        # produced by the GGUF reader. _dequant_q6_k emits fp16 directly.
+        fp16_data = _dequant_q6_k(data.numpy(), out_dtype=np.float16)
         if hasattr(parent, 'weight') and parent.weight is not None:
             parent.weight.data = torch.from_numpy(
                 fp16_data).to(parent.weight.device, parent.weight.dtype)
@@ -1153,109 +1205,86 @@ class Gemma4Model(nn.Module):
                 del mod._qweight_raw  # free CPU memory
 
     def _inject_missing_kv_weights(self):
-        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF."""
-        import os, glob
-        from safetensors import safe_open
+        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF.
 
-        bf16_dir = '/ssd/models/gemma-4-E2B-it'
-        if not os.path.isdir(bf16_dir):
-            import logging
-            logging.getLogger(__name__).warning(
-                "GGUF: bf16 model not found at %s, cannot inject missing k/v",
-                bf16_dir)
-            return
+        Gemma4 E2B uses shared KV: layers >= n_layer_kv_from_start (=15) reuse
+        an earlier layer's K/V (they have no k_proj/v_proj of their own in the
+        GGUF - the exporter drops them because they're identical to the reuse
+        source). Per llama.cpp (src/llama-model.cpp):
 
+            if il >= n_layer_kv_from_start:
+                reuse = n_layer_kv_from_start - (is_swa(il) ? 2 : 1)
+                #  -> layer 13 (SWA shared) or layer 14 (dense shared)
+
+        So instead of loading the bf16 model and re-quantizing (which produced
+        wrong k/v - the re-quant differs from the GGUF's own Q4_0 layer-13/14,
+        causing garbled output), we COPY the already-converted Q4_0 NZ k/v
+        shards + scales from layer 13/14 to each shared layer. This is
+        bit-exact with llama.cpp and needs no bf16 model.
+        """
         num_kv_shared = getattr(self.config, "num_kv_shared_layers", 0)
         if num_kv_shared <= 0:
             return
-        first_kv_shared = self.config.num_hidden_layers - num_kv_shared
+        n_layers = self.config.num_hidden_layers
+        first_kv_shared = n_layers - num_kv_shared  # =15
 
-        safetensor_files = sorted(glob.glob(os.path.join(bf16_dir, '*.safetensors')))
-        if not safetensor_files:
-            return
-
-        # Pre-load all k_proj AND v_proj weights from the bf16 model
-        needed_k_weights = {}
-        needed_v_weights = {}
-        for f in safetensor_files:
-            with safe_open(f, framework='pt') as sf:
-                for key in sf.keys():
-                    if 'self_attn.k_proj.weight' in key:
-                        parts = key.split('.')
-                        if 'layers' in parts:
-                            idx = int(parts[parts.index('layers') + 1])
-                            if idx >= first_kv_shared:
-                                needed_k_weights[idx] = sf.get_tensor(key)
-                    elif 'self_attn.v_proj.weight' in key:
-                        parts = key.split('.')
-                        if 'layers' in parts:
-                            idx = int(parts[parts.index('layers') + 1])
-                            if idx >= first_kv_shared:
-                                needed_v_weights[idx] = sf.get_tensor(key)
+        # Per-layer is_swa pattern (read from GGUF by the loader and stashed on
+        # config). Falls back to the gemma2-style 5-layer pattern
+        # [1,1,1,1,0,...] if absent.
+        is_swa = getattr(self.config, "sliding_window_pattern", None)
+        if not is_swa:
+            is_swa = [0 if (i % 5 == 4) else 1 for i in range(n_layers)]
 
         import logging
         _log = logging.getLogger(__name__)
+
+        # Sanity: the two reuse sources (13 SWA, 14 dense) must exist and have
+        # converted k/v shards by now (this runs after _convert_q4_0_weights).
+        def get_src(il):
+            return first_kv_shared - (2 if is_swa[il] else 1)
+
         injected = 0
-        for idx in range(first_kv_shared, self.config.num_hidden_layers):
-            if idx >= len(self.layers):
+        for il in range(first_kv_shared, n_layers):
+            if il >= len(self.layers):
                 break
-            layer = self.layers[idx]
+            layer = self.layers[il]
             qkv = layer.self_attn.qkv_proj
-
-            # Skip if k shard already exists
             if hasattr(qkv, '_qweight_nz_shards') and 'k' in qkv._qweight_nz_shards:
+                continue  # already has k (shouldn't happen for shared layers)
+
+            src = get_src(il)
+            src_qkv = self.layers[src].self_attn.qkv_proj
+            if not (hasattr(src_qkv, '_qweight_nz_shards')
+                    and 'k' in src_qkv._qweight_nz_shards
+                    and 'v' in src_qkv._qweight_nz_shards):
+                _log.warning("GGUF: layer %d reuse source %d has no converted "
+                             "k/v shards; skipping", il, src)
                 continue
 
-            k_tensor = needed_k_weights.get(idx)
-            v_tensor = needed_v_weights.get(idx)
-            if k_tensor is None or v_tensor is None:
-                _log.warning("GGUF: layer %d k/v not found in bf16 model", idx)
-                continue
-
-            # Quantize and convert k_proj
-            k_f32 = k_tensor.float().numpy()
-            Nk, K = k_f32.shape
-            gguf_k = _quantize_f32_to_q4_0(k_f32)
-            nz_k = np.zeros(K * Nk // 2, dtype=np.uint8)
-            sc_k = np.zeros(K // 32 * Nk, dtype=np.uint16)
-            convert_gguf_q4_0_qweight(gguf_k, nz_k, sc_k, Nk, K)
-
-            # Quantize and convert v_proj
-            v_f32 = v_tensor.float().numpy()
-            Nv, Kv = v_f32.shape
-            gguf_v = _quantize_f32_to_q4_0(v_f32)
-            nz_v = np.zeros(Kv * Nv // 2, dtype=np.uint8)
-            sc_v = np.zeros(Kv // 32 * Nv, dtype=np.uint16)
-            convert_gguf_q4_0_qweight(gguf_v, nz_v, sc_v, Nv, Kv)
-
-            # Initialize shard dicts if not already present
             if not hasattr(qkv, '_qweight_nz_shards'):
                 qkv._qweight_nz_shards = {}
                 qkv._scales_shards = {}
                 qkv._qweight_shard_n = {}
                 qkv._qweight_shard_k = {}
-
-            # Store k shard
-            qkv._qweight_nz_shards['k'] = torch.from_numpy(nz_k.ravel()).npu()
-            qkv._scales_shards['k'] = torch.from_numpy(
-                sc_k.ravel().view(np.float16)).npu()
-            qkv._qweight_shard_n['k'] = Nk
-            qkv._qweight_shard_k['k'] = K
-
-            # Store v shard
-            qkv._qweight_nz_shards['v'] = torch.from_numpy(nz_v.ravel()).npu()
-            qkv._scales_shards['v'] = torch.from_numpy(
-                sc_v.ravel().view(np.float16)).npu()
-            qkv._qweight_shard_n['v'] = Nv
-            qkv._qweight_shard_k['v'] = Kv
-
+            # Copy (clone) the source's k/v NZ shards + scales + dims to this
+            # shared layer. Clone rather than reference: the shared layer's k/v
+            # output is discarded (is_kv_shared_layer -> _should_write_kv=False,
+            # attention reads from L13/L14's cache), so the values don't affect
+            # the result - but the weights MUST exist with the right shape for
+            # the qkv matmul to produce the correct output size. Cloning avoids
+            # aliasing if any post-load step mutates per-layer weight tensors.
+            for kvk in ('k', 'v'):
+                qkv._qweight_nz_shards[kvk] = src_qkv._qweight_nz_shards[kvk].clone()
+                qkv._scales_shards[kvk] = src_qkv._scales_shards[kvk].clone()
+                qkv._qweight_shard_n[kvk] = src_qkv._qweight_shard_n[kvk]
+                qkv._qweight_shard_k[kvk] = src_qkv._qweight_shard_k[kvk]
             injected += 1
-            _log.debug("GGUF: injected k/v Q4_0 for layer %d (Nk=%d Nv=%d K=%d)",
-                       idx, Nk, Nv, K)
+            _log.debug("GGUF: layer %d reuses k/v from layer %d (is_swa=%d)",
+                       il, src, is_swa[il])
 
         if injected > 0:
-            _log.info("GGUF: injected missing k/v Q4_0 for %d layers from bf16 model",
-                      injected)
+            _log.info("GGUF: copied shared k/v (from layers 13/14) for %d "
+                      "layers", injected)
 
     def _post_load_process_weights(self):
         """Call process_weights_after_loading on non-Q4_0 modules.
@@ -1373,9 +1402,14 @@ class Gemma4Model(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Remap checkpoint q_norm.weight -> param q_norm_weight
-                # and k_norm.weight -> k_norm_weight
+                # and k_norm.weight -> k_norm_weight. Also strip the ".weight"
+                # suffix the GGUF name carries for layer_scalar (GGUF tensor is
+                # blk.N.layer_output_scale.weight -> mapped to
+                # model.layers.N.layer_scalar.weight, but the buffer is registered
+                # as "layer_scalar" with no ".weight").
                 for suffix, replacement in [(".q_norm.weight", ".q_norm_weight"),
-                                            (".k_norm.weight", ".k_norm_weight")]:
+                                            (".k_norm.weight", ".k_norm_weight"),
+                                            (".layer_scalar.weight", ".layer_scalar")]:
                     if name.endswith(suffix):
                         name = name.replace(suffix, replacement)
                         break

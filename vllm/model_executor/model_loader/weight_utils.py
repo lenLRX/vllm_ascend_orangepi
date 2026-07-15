@@ -10,7 +10,6 @@ from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
                     Tuple, Union)
 
 import filelock
-import gguf
 import huggingface_hub.constants
 import numpy as np
 import torch
@@ -429,8 +428,7 @@ def pt_weights_iterator(
 
 
 def get_gguf_extra_tensor_names(
-        gguf_file: str, gguf_to_hf_name_map: Dict[str, str]) -> List[str]:
-    reader = gguf.GGUFReader(gguf_file)
+        reader, gguf_to_hf_name_map: Dict[str, str]) -> List[str]:
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
@@ -438,15 +436,16 @@ def get_gguf_extra_tensor_names(
 
 
 def gguf_quant_weights_iterator(
-    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+    reader, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
+
+    ``reader`` is an already-open GGUF reader (opened once by the caller -
+    the upstream gguf library spent ~89s per open decoding tokenizer arrays
+    vLLM never reads; re-opening per-call tripled that cost).
     """
-
-    reader = gguf.GGUFReader(gguf_file)
-
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
             weight_type = tensor.tensor_type

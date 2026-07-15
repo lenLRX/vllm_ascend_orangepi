@@ -13,13 +13,14 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
-import gguf
 import huggingface_hub
 import numpy as np
+# Our own fast GGUF reader (replaces the gguf library - which spent ~89s/open
+# decoding tokenizer arrays vLLM never uses). See gguf_reader.py.
+from vllm.model_executor.model_loader.gguf_reader import GGUFReader
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
-from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from vllm.config import (LoadConfig, LoadFormat, ModelConfig, ParallelConfig,
@@ -1098,7 +1099,8 @@ class GGUFModelLoader(BaseModelLoader):
         else:
             raise ValueError(f"{model_name_or_path} is not a file.")
 
-    def _get_gguf_weights_map(self, model_config: ModelConfig):
+    def _get_gguf_weights_map(self, model_config: ModelConfig,
+                              gguf_reader: GGUFReader):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
         `blk.N.BB.weight` and `blk.N.BB.bias`
@@ -1106,25 +1108,17 @@ class GGUFModelLoader(BaseModelLoader):
         attention/mlp layer components.
         See "Standardized tensor names" in
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
+
+        ``gguf_reader`` is an already-open fast reader (opened once in
+        load_model); the upstream library's get_tensor_name_map / MODEL_ARCH_NAMES
+        were removed (they were vestigial - the hardcoded maps below cover every
+        Gemma4 tensor suffix).
         """
         config = model_config.hf_config
         model_type = config.model_type
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
-        arch = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == model_type:
-                arch = key
-                break
-        if arch is None:
-            # Fallback: use gemma arch for gemma4 (similar architecture)
-            for key, value in gguf.MODEL_ARCH_NAMES.items():
-                if value == "gemma":
-                    arch = key
-                    break
-            if arch is None:
-                raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         # Gemma4 nests num_hidden_layers inside text_config
         if (hasattr(config, 'text_config') and config.text_config is not None
                 and hasattr(config.text_config, 'num_hidden_layers')):
@@ -1133,7 +1127,6 @@ class GGUFModelLoader(BaseModelLoader):
             num_layers = config.num_hidden_layers
         else:
             raise RuntimeError(f"Cannot determine num_hidden_layers for {model_type}")
-        name_map = gguf.get_tensor_name_map(arch, num_layers)
 
         import logging as _logging
         _logger = _logging.getLogger(__name__)
@@ -1147,26 +1140,15 @@ class GGUFModelLoader(BaseModelLoader):
             # a reverse lookup from the mapping tables and match against
             # actual GGUF tensor names.
 
-            # 1. Reverse the non-block mapping: gguf_name → hf_name
-            #    Skip block entries (they contain "blk" or "{bid}")
-            #    because mappings_cfg instantiated wrong-arch templates.
+            # 1. Reverse the non-block mapping: gguf_name -> hf_name.
+            #    The hardcoded entries below are the sole source - the
+            #    gguf library's get_tensor_name_map seed was vestigial
+            #    (every Gemma4 tensor suffix is covered here + in _gguf_suffix_to_template).
             _reverse_map = {}
-            for hf_name, (ttype, gguf_base) in name_map.mapping.items():
-                if "blk" in str(gguf_base) or "{bid}" in str(gguf_base):
-                    continue  # block entry, handled via _block_reverse
-                if gguf_base not in _reverse_map:
-                    _reverse_map[gguf_base] = hf_name
 
-            # 2. Per-block: build reverse map gguf_suffix → hf_template
+            # 2. Per-block: reverse map gguf_suffix -> hf_template.
+            #    Seeded solely from _gguf_suffix_to_template below (step 3).
             _block_reverse = {}
-            for ttype, hf_templates in name_map.block_mappings_cfg.items():
-                if not hf_templates:
-                    continue
-                # first template is the canonical one
-                canonical = hf_templates[0]
-                # Extract the GGUF suffix from the type name (e.g., ATTN_Q → attn_q)
-                ttype_name = ttype.name.lower()  # e.g., "attn_q"
-                _block_reverse[ttype_name] = canonical
 
             # 3. Additional block mappings: GGUF suffix → HF template.
             #    Some GGUF suffixes differ from the gguf type enum names
@@ -1180,7 +1162,10 @@ class GGUFModelLoader(BaseModelLoader):
                 "attn_norm":    "model.layers.{bid}.input_layernorm",
                 "attn_q_norm":  "model.layers.{bid}.self_attn.q_norm",
                 "attn_k_norm":  "model.layers.{bid}.self_attn.k_norm",
-                "ffn_norm":     "model.layers.{bid}.mlp.pre_ffn_layernorm",
+                # GGUF "ffn_norm" -> vLLM Gemma4DecoderLayer.pre_feedforward_layernorm
+                # (NOT mlp.pre_ffn_layernorm — the MLP has no norm module; the
+                # pre/post FFN norms live directly on the decoder layer).
+                "ffn_norm":     "model.layers.{bid}.pre_feedforward_layernorm",
                 "ffn_gate":     "model.layers.{bid}.mlp.gate_proj",
                 "ffn_up":       "model.layers.{bid}.mlp.up_proj",
                 "ffn_down":     "model.layers.{bid}.mlp.down_proj",
@@ -1190,9 +1175,15 @@ class GGUFModelLoader(BaseModelLoader):
                 "inp_gate":     "model.layers.{bid}.per_layer_input_gate",
                 "proj":         "model.layers.{bid}.per_layer_projection",
                 "post_attention_norm": "model.layers.{bid}.post_attention_layernorm",
-                "post_ffw_norm": "model.layers.{bid}.post_ffw_layernorm",
+                # GGUF "post_ffw_norm" -> vLLM Gemma4DecoderLayer.post_feedforward_layernorm
+                "post_ffw_norm": "model.layers.{bid}.post_feedforward_layernorm",
                 "post_norm":    "model.layers.{bid}.post_per_layer_input_norm",
-                "layer_output_scale": "model.layers.{bid}.layer_output_scale",
+                # GGUF "layer_output_scale" -> vLLM buffer "layer_scalar" (the
+                # _layer_scalar_f the forward multiplies by). The bf16 checkpoint
+                # already names this "layer_scalar"; the GGUF name differs, so
+                # without this mapping the scale is silently dropped and
+                # _layer_scalar_f stays 1.0, leaving layer output ~45x too large.
+                "layer_output_scale": "model.layers.{bid}.layer_scalar",
             }
             _block_reverse.update(_gguf_suffix_to_template)
 
@@ -1205,12 +1196,23 @@ class GGUFModelLoader(BaseModelLoader):
             _reverse_map["per_layer_token_embd"] = "model.embed_tokens_per_layer"
             _reverse_map["rope_freqs"] = "model.rope_freqs"
 
-            # 5. Read GGUF tensor names and build the final map
-            gguf_path = model_config.model
-            gguf_reader = gguf.GGUFReader(gguf_path)
+            # 5. Read GGUF tensor names and build the final map (using the
+            #    already-open fast reader passed in from load_model - no re-open).
+            #    Also extract the per-layer sliding_window_pattern (is_swa array)
+            #    so the model can build the KV-shared reuse map without re-opening
+            #    the GGUF or depending on the (removed) gguf library.
             gguf_to_hf_name_map = {}
             import re
             _blk_pat = re.compile(r'blk\.(\d+)\.(.+)')
+
+            swp_field = gguf_reader.fields.get(
+                "gemma4.attention.sliding_window_pattern")
+            if swp_field is not None and len(swp_field.parts) >= 6:
+                # Array layout: [klen, kdata, vtype, itype, alen, elem0, ...]
+                alen = int(swp_field.parts[4][0])
+                is_swa = [int(swp_field.parts[5 + i][0])
+                          for i in range(alen)]
+                config.sliding_window_pattern = is_swa
 
             for tensor in gguf_reader.tensors:
                 gguf_full = tensor.name
@@ -1252,25 +1254,20 @@ class GGUFModelLoader(BaseModelLoader):
                     raise RuntimeError(f"Name map contains blk: {k} -> {v}")
             return gguf_to_hf_name_map
 
-        # Ensure config has _name_or_path for from_config
-        if not hasattr(config, '_name_or_path') or config._name_or_path is None:
-            config._name_or_path = model_type
-        with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True)
-        state_dict = dummy_model.state_dict()
-
-        gguf_to_hf_name_map = {}
-        for hf_name in state_dict:
-            name, suffix = hf_name.rsplit(".", 1)
-            gguf_name = name_map.get_name(name)
-            gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
-        return gguf_to_hf_name_map
+        # Non-gemma4 GGUF models previously used the gguf library's
+        # get_tensor_name_map for HF<->GGUF name translation. That dependency
+        # was removed (see gguf_reader.py). This branch targets gemma4 only;
+        # extending it to other arches requires a hardcoded map like the one
+        # above, not the removed library helper.
+        raise NotImplementedError(
+            f"GGUF name mapping for model_type={model_type!r} is not supported "
+            "in this build (the gguf library was removed). Only 'gemma4' has a "
+            "hardcoded GGUF->HF name map.")
 
     def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+        self, gguf_reader: GGUFReader, gguf_to_hf_name_map: Dict[str, str]
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path,
+        return gguf_quant_weights_iterator(gguf_reader,
                                            gguf_to_hf_name_map)
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -1280,17 +1277,21 @@ class GGUFModelLoader(BaseModelLoader):
         device_config = vllm_config.device_config
         model_config = vllm_config.model_config
         local_model_path = self._prepare_weights(model_config.model)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
+        # Open the GGUF reader ONCE and reuse it for the name map, the extra-
+        # tensor check, and the weight iteration. The upstream code opened it
+        # 3x (~89s each on a 256k-vocab model, parsing tokenizer arrays).
+        gguf_reader = GGUFReader(local_model_path)
+        gguf_weights_map = self._get_gguf_weights_map(model_config, gguf_reader)
         # we can only know if tie word embeddings after mapping weights
         if "lm_head.weight" in get_gguf_extra_tensor_names(
-                local_model_path, gguf_weights_map):
+                gguf_reader, gguf_weights_map):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(vllm_config=vllm_config)
             model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map))
+                self._get_weights_iterator(gguf_reader, gguf_weights_map))
         return model
 
 
