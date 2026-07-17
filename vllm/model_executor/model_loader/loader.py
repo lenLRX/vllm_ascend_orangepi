@@ -1192,7 +1192,12 @@ class GGUFModelLoader(BaseModelLoader):
             _reverse_map["token_embd"] = "model.embed_tokens"
             _reverse_map["output_norm"] = "model.norm"
             _reverse_map["per_layer_model_proj"] = "model.per_layer_model_projection"
-            _reverse_map["per_layer_proj_norm"] = "model.per_layer_proj_norm"
+            # Module attr is `per_layer_projection_norm` (gemma4_npu.py), NOT
+            # `per_layer_proj_norm`.  Mapping to the wrong name silently dropped
+            # this norm weight, leaving it as uninitialized torch.empty garbage —
+            # which corrupts the PLE path and (since garbage differs per process)
+            # made the Q4_0 output nondeterministic across runs.
+            _reverse_map["per_layer_proj_norm"] = "model.per_layer_projection_norm"
             _reverse_map["per_layer_token_embd"] = "model.embed_tokens_per_layer"
             _reverse_map["rope_freqs"] = "model.rope_freqs"
 
