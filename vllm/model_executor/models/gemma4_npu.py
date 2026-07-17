@@ -479,7 +479,6 @@ class Gemma4Attention(nn.Module):
             k_out = k_roped_flat
             v_out = v_normed.reshape(token_num, self.kv_size)
             self._should_write_kv = True
-                _dump_npu_tensor(v_out, "/tmp/dbg/l0_v_normed.npy")
         else:
             q = q_roped_flat
             # KV-shared layers: K/V come from the shared cache (filled by L13/L14).
