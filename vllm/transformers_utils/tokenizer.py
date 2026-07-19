@@ -84,6 +84,42 @@ def patch_padding_side(tokenizer: PreTrainedTokenizer) -> None:
     tokenizer._pad = MethodType(_pad, tokenizer)
 
 
+def _fallback_chat_template(tokenizer_dir: str,
+                            gguf_file_name: Optional[str]) -> Optional[str]:
+    """Find a chat template when the tokenizer itself defines none.
+
+    Looks for (1) a ``chat_template.jinja`` file next to the tokenizer
+    (transformers convention), then (2) a ``tokenizer.chat_template``
+    metadata field embedded in a GGUF file in the same directory.
+    """
+    base = Path(tokenizer_dir)
+    if not base.is_dir():
+        return None
+    jinja = base / "chat_template.jinja"
+    if jinja.is_file():
+        logger.info("Loaded chat template from %s", jinja)
+        return jinja.read_text(encoding="utf-8")
+
+    candidates = ([base / gguf_file_name] if gguf_file_name else sorted(
+        base.glob("*.gguf")))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            from vllm.model_executor.model_loader.gguf_reader import (
+                GGUFReader)
+            field = GGUFReader(str(path)).get_field(
+                "tokenizer.chat_template")
+            if field is not None:
+                template = bytes(field.parts[field.data[0]]).decode("utf-8")
+                logger.info("Loaded chat template embedded in %s", path)
+                return template
+        except Exception as e:
+            logger.warning("Failed to read chat template from %s: %s", path,
+                           e)
+    return None
+
+
 def get_tokenizer(
     tokenizer_name: Union[str, Path],
     *args,
@@ -174,6 +210,13 @@ def get_tokenizer(
             logger.warning(
                 "Using a slow tokenizer. This might cause a significant "
                 "slowdown. Consider using a fast tokenizer instead.")
+        if getattr(tokenizer, 'chat_template', None) is None:
+            # The tokenizer carries no template (e.g. GGUF exports); try the
+            # jinja file or GGUF-embedded template next to the tokenizer.
+            fallback_template = _fallback_chat_template(
+                str(tokenizer_name), kwargs.get('gguf_file'))
+            if fallback_template is not None:
+                tokenizer.chat_template = fallback_template
         tokenizer = get_cached_tokenizer(tokenizer)
 
     return tokenizer

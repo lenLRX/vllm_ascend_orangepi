@@ -53,7 +53,8 @@ from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
                            SequenceStatus)
 from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
                           init_tracer)
-from vllm.transformers_utils.config import try_get_generation_config
+from vllm.transformers_utils.config import (
+    try_get_generation_config, try_get_gguf_generation_config_dict)
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import (
@@ -69,16 +70,24 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 def _load_generation_config_dict(model_config: ModelConfig) -> Dict[str, Any]:
     # For file-based models (e.g. GGUF), generation_config.json cannot be
-    # discovered from the weights file path. Look it up from the tokenizer
-    # directory first, which is where the user points for model metadata.
+    # discovered from the weights file path. A generation_config.json next
+    # to the tokenizer takes precedence; otherwise derive defaults from the
+    # file's own metadata (embedded sampling params + arch eos defaults).
     if os.path.isfile(model_config.model):
-        tokenizer_config = try_get_generation_config(
-            model_config.tokenizer,
-            trust_remote_code=model_config.trust_remote_code,
-            revision=model_config.revision,
-        )
-        if tokenizer_config is not None:
-            return tokenizer_config.to_diff_dict()
+        tokenizer_dir = model_config.tokenizer
+        if (tokenizer_dir and os.path.isdir(tokenizer_dir)
+                and os.path.isfile(
+                    os.path.join(tokenizer_dir, "generation_config.json"))):
+            config = try_get_generation_config(
+                tokenizer_dir,
+                trust_remote_code=model_config.trust_remote_code,
+                revision=model_config.revision,
+            )
+            if config is not None:
+                return config.to_diff_dict()
+        gguf_dict = try_get_gguf_generation_config_dict(model_config.model)
+        if gguf_dict:
+            return gguf_dict
 
     config = try_get_generation_config(
         model_config.model,

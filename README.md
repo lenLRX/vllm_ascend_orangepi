@@ -81,19 +81,17 @@ python -m vllm.entrypoints.openai.api_server \
   --served-model-name gemma-4-E2B-q4_0 \
   --trust-remote-code --dtype float16 --max-model-len 2048 \
   --gpu-memory-utilization 0.9 --enforce-eager --block-size 64 \
-  --chat-template /ssd/models/gemma-4-E2B-it/chat_template.jinja \
   --port 8000
 ```
 
-注意：GGUF 模型目录的 tokenizer 没有内嵌 chat template，使用
-`/v1/chat/completions` 时必须通过 `--chat-template` 指定
-（可复用 bf16 模型目录中的 `chat_template.jinja`，两者 tokenizer 一致），
-否则 chat 接口会返回 400 错误。
+chat template 与停止符均无需手动配置：
 
-另外，GGUF 目录还需放入 `generation_config.json`（内容同 bf16 模型，
-关键是 `eos_token_id: [1, 106, 50]`）。vllm 对文件形式的模型会从
-tokenizer 目录读取它；缺失时引擎只把 `<eos>`(1) 当作停止符，模型输出
-`<turn|>`(106) 时不会停止，会陷入 `<turn|>` 无限重复。
+- chat template：tokenizer 未内嵌模板时，vllm 会依次尝试 tokenizer 目录下的
+  `chat_template.jinja` 和 GGUF 文件内嵌的 `tokenizer.chat_template`。
+  也可用 `--chat-template` 显式覆盖。
+- 停止符：GGUF 模型的 eos 由 vllm 按架构内置默认值处理
+  （Gemma4 为 `[1, 106, 50]`，含回合结束符 `<turn|>`(106)）。
+  如需自定义，可在 tokenizer 目录放置 `generation_config.json` 覆盖。
 
 解码性能（256 token 输入，贪心解码，Ascend 310B1，预热后）：
 

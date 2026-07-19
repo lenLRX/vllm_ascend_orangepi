@@ -580,3 +580,56 @@ def try_get_generation_config(
             return GenerationConfig.from_model_config(config)
         except (OSError, AttributeError):  # Not found or config incompatibility
             return None
+
+
+# Default eos_token_id lists for architectures whose GGUF exports carry no
+# generation_config (the tokenizer alone only knows the primary eos, so
+# turn-end markers would never stop generation).
+_GGUF_ARCH_DEFAULT_EOS = {
+    "gemma4": [1, 106, 50],
+}
+
+
+def try_get_gguf_generation_config_dict(model: str) -> Optional[Dict[str,
+                                                                    Any]]:
+    """Derive generation-config fields from a GGUF file's own metadata.
+
+    Reads the embedded sampling defaults and applies per-architecture eos
+    defaults. Returns None when the file cannot be read as GGUF.
+    """
+    try:
+        from vllm.model_executor.model_loader.gguf_reader import (
+            GGUFReader)
+        reader = GGUFReader(model)
+    except Exception:
+        return None
+
+    def _scalar(key: str):
+        field = reader.get_field(key)
+        if field is None:
+            return None
+        try:
+            return field.parts[field.data[0]].reshape(-1)[0].item()
+        except Exception:
+            return None
+
+    def _string(key: str):
+        field = reader.get_field(key)
+        if field is None:
+            return None
+        try:
+            return bytes(field.parts[field.data[0]]).decode("utf-8")
+        except Exception:
+            return None
+
+    result: Dict[str, Any] = {}
+    for gguf_key, cfg_key in (("general.sampling.top_k", "top_k"),
+                              ("general.sampling.top_p", "top_p"),
+                              ("general.sampling.temp", "temperature")):
+        val = _scalar(gguf_key)
+        if val is not None:
+            result[cfg_key] = val
+    eos = _GGUF_ARCH_DEFAULT_EOS.get(_string("general.architecture") or "")
+    if eos is not None:
+        result["eos_token_id"] = eos
+    return result or None
