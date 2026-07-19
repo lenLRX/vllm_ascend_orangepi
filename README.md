@@ -73,6 +73,23 @@ outputs = llm.generate(["The capital of France is"],
                        SamplingParams(temperature=0.0, max_tokens=32))
 ```
 
+OpenAI http api 服务（GGUF Q4_0）：
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model /ssd/models/gemma-4-E2B-it-qat-q4_0-gguf/gemma-4-E2B_q4_0-it.gguf \
+  --tokenizer /ssd/models/gemma-4-E2B-it-qat-q4_0-gguf \
+  --served-model-name gemma-4-E2B-q4_0 \
+  --trust-remote-code --dtype float16 --max-model-len 2048 \
+  --gpu-memory-utilization 0.9 --enforce-eager --block-size 64 \
+  --chat-template /ssd/models/gemma-4-E2B-it/chat_template.jinja \
+  --port 8000
+```
+
+注意：GGUF 模型目录的 tokenizer 没有内嵌 chat template，使用
+`/v1/chat/completions` 时必须通过 `--chat-template` 指定
+（可复用 bf16 模型目录中的 `chat_template.jinja`，两者 tokenizer 一致），
+否则 chat 接口会返回 400 错误。
+
 解码性能（256 token 输入，贪心解码，Ascend 310B1，预热后）：
 
 | 模型 | 解码速度 |
