@@ -44,6 +44,47 @@ for i, output in enumerate(outputs):
 <img width="1612" height="894" alt="image" src="https://github.com/user-attachments/assets/36796bb9-ddbc-4f9c-960e-a3cc071b730e" />
 如果使用本地模型，"模型ID"填启动命令行的--model参数中给的路径
 
+## Gemma4 支持 (GGUF Q4_0 / Q6_K / bf16)
+
+支持在 Ascend 310B1 (Orange Pi AI Pro) 上运行 Gemma4 E2B/E4B：
+
+- **bf16** safetensors 模型直接加载
+- **GGUF Q4_0** 量化模型（含 Google QAT q4_0 gguf），自定义 CCE 融合反量化+矩阵乘内核（NZ 布局）
+- **Q6_K lm_head** 融合反量化+矩阵乘内核（int8 布局，权重无损展开），由环境变量 `GEMMA4_LMHEAD_Q6K` 控制（默认开启，设 `0` 关闭）
+
+GGUF 模型加载示例：
+```python
+from vllm import LLM, SamplingParams
+
+model_dir = '/ssd/models/gemma-4-E2B-it-qat-q4_0-gguf'
+llm = LLM(
+    model=f'{model_dir}/gemma-4-E2B_q4_0-it.gguf',
+    tokenizer=model_dir,
+    trust_remote_code=True,
+    dtype='float16', max_model_len=2048,
+    gpu_memory_utilization=0.9, enforce_eager=True, block_size=64,
+)
+outputs = llm.generate(["The capital of France is"],
+                       SamplingParams(temperature=0.0, max_tokens=32))
+```
+
+解码性能（256 token 输入，贪心解码，Ascend 310B1，预热后）：
+
+| 模型 | 解码速度 |
+|---|---|
+| gemma-4-E2B-it (bf16) | 5.2 tok/s (191 ms/tok) |
+| gemma-4-E2B-it (GGUF Q4_0) | 11.8 tok/s (85 ms/tok) |
+
+提示：每个进程首次贪心解码会触发一次 TBE 编译（argmax/log_softmax，约 50 秒），
+之后命中磁盘缓存；压测前请先跑 1-2 个 token 预热。
+
+内核源码在子模块 `/data/llm_simple/src/npu_ops`，构建产物部署到
+`vllm/model_executor/layers/npu/`。详细优化与对比报告见：
+[docs/q4_decode_baseline.md](docs/q4_decode_baseline.md)、
+[docs/q4_decode_optimization_final.md](docs/q4_decode_optimization_final.md)、
+[docs/bf16_vs_q4_decode_report.md](docs/bf16_vs_q4_decode_report.md)、
+[docs/q6k_lm_head_kernel.md](docs/q6k_lm_head_kernel.md)。
+
 
 
 <p align="center">
