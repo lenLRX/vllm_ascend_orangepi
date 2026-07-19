@@ -1,3 +1,4 @@
+import os
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -67,6 +68,18 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 
 def _load_generation_config_dict(model_config: ModelConfig) -> Dict[str, Any]:
+    # For file-based models (e.g. GGUF), generation_config.json cannot be
+    # discovered from the weights file path. Look it up from the tokenizer
+    # directory first, which is where the user points for model metadata.
+    if os.path.isfile(model_config.model):
+        tokenizer_config = try_get_generation_config(
+            model_config.tokenizer,
+            trust_remote_code=model_config.trust_remote_code,
+            revision=model_config.revision,
+        )
+        if tokenizer_config is not None:
+            return tokenizer_config.to_diff_dict()
+
     config = try_get_generation_config(
         model_config.model,
         trust_remote_code=model_config.trust_remote_code,

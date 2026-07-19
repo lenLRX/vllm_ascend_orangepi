@@ -90,6 +90,11 @@ python -m vllm.entrypoints.openai.api_server \
 （可复用 bf16 模型目录中的 `chat_template.jinja`，两者 tokenizer 一致），
 否则 chat 接口会返回 400 错误。
 
+另外，GGUF 目录还需放入 `generation_config.json`（内容同 bf16 模型，
+关键是 `eos_token_id: [1, 106, 50]`）。vllm 对文件形式的模型会从
+tokenizer 目录读取它；缺失时引擎只把 `<eos>`(1) 当作停止符，模型输出
+`<turn|>`(106) 时不会停止，会陷入 `<turn|>` 无限重复。
+
 解码性能（256 token 输入，贪心解码，Ascend 310B1，预热后）：
 
 | 模型 | 解码速度 |
