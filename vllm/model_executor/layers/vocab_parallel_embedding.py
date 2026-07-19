@@ -43,6 +43,27 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         assert bias is None
+        # GGUF Q6_K int8 lm_head path: fused dequant+matmul kernel on the
+        # int8-expanded token_embd copy (built at load by _convert_q6_k_lm_head).
+        if getattr(layer, '_q6k_i8_qweight', None) is not None:
+            from vllm.model_executor.layers.npu.py_npu_ops import (
+                matmul_gguf_q6_k_i8_layer)
+            N = layer._q6k_i8_n
+            K = layer._q6k_i8_k
+            m = x.reshape(-1, K).shape[0]
+            x_flat = x.reshape(-1).contiguous()
+            if x_flat.dtype == torch.bfloat16:
+                x_flat = x_flat.half()
+            output = torch.empty(x.shape[:-1] + (N,), dtype=torch.float16,
+                                 device="npu")
+            matmul_gguf_q6_k_i8_layer(
+                get_pointer(output), get_pointer(x_flat),
+                get_pointer(layer._q6k_i8_qweight),
+                get_pointer(layer._q6k_i8_gs),
+                m, N, K, to_npu_dtype(torch.float16), get_default_stream())
+            if x.dtype == torch.bfloat16:
+                output = output.bfloat16()
+            return output
         weight = getattr(self, "transposed_weight", layer.weight)
         n, k = weight.shape
         m = x.reshape(-1, k).shape[0]

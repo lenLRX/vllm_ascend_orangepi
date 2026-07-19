@@ -31,6 +31,43 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _greedy_fast_path_ok(sampling_metadata) -> bool:
+    """Whether every sequence group can use the on-device greedy argmax.
+
+    Falls back to the full CPU sampler when anything could change the argmax
+    (penalties, min_tokens) or when logprob details are requested.
+    top_k/top_p/min_p are safe: they never remove the global argmax.
+    """
+    if sampling_metadata is None:
+        return False
+    for sg in sampling_metadata.seq_groups:
+        if not sg.do_sample:
+            continue
+        sp = sg.sampling_params
+        if sp is None:
+            return False
+        if sp.temperature is None or sp.temperature > 1e-5:
+            return False
+        if getattr(sp, 'presence_penalty', 0.0) not in (0.0, None):
+            return False
+        if getattr(sp, 'frequency_penalty', 0.0) not in (0.0, None):
+            return False
+        if getattr(sp, 'repetition_penalty', 1.0) not in (1.0, None):
+            return False
+        if getattr(sp, 'logprobs', None) is not None:
+            return False
+        if getattr(sp, 'prompt_logprobs', None) is not None:
+            return False
+        if getattr(sp, 'min_tokens', 0):
+            return False
+        if getattr(sp, 'use_beam_search', False):
+            return False
+        if len(sg.seq_ids) != 1:
+            return False
+    return True
+
+
 @dataclass(frozen=False)
 class NPUAttentionMetadata:
     offsets: Optional[List[int]] = None
@@ -349,6 +386,13 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
         #logger.info(f"input_tokens {model_input.input_tokens}")
         #logger.info(f"input_positions {model_input.input_positions}")
         # TODO split batch and merge
+        _pt = os.environ.get("Q4_PHASE_TIMING", "0") == "1"
+        if _pt:
+            import time as _time
+            _t0 = _time.perf_counter()
+            _prev = getattr(self, '_phase_prev_ret', None)
+            if _prev is not None:
+                print(f"PHASE engine_gap={_t0 - _prev:.3f}s")
         hidden_states = self.model(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
@@ -358,21 +402,76 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             **MultiModalKwargs.as_kwargs(model_input.multi_modal_kwargs or {},
                                          device=self.device),
         )
+        if _pt:
+            torch.npu.synchronize()
+            _t1 = _time.perf_counter()
         #logger.info(f"inference_dome")
 
         # Compute the logits only if the on-device sampling is turned off as
         # on-device sampling outputs the token ids.
         logits = self.model.compute_logits(hidden_states,
                                                model_input.sampling_metadata)
-        #logger.info(f"compute_logits done")
-        logits = logits.cpu()
-        # Sample the next token.
-        output = self.model.sample(
-            logits=logits,
-            sampling_metadata=model_input.sampling_metadata,
-        )
+        if _pt:
+            torch.npu.synchronize()
+            _t2 = _time.perf_counter()
+        # Greedy fast path: argmax on device, skip the full-vocab logits D2H
+        # copy and the CPU softmax/log_softmax (~10ms/token on this host).
+        output = None
+        if _greedy_fast_path_ok(model_input.sampling_metadata):
+            output = self._greedy_sample_on_device(
+                logits, model_input.sampling_metadata)
+        if output is None:
+            #logger.info(f"compute_logits done")
+            logits = logits.cpu()
+            if _pt:
+                _t3 = _time.perf_counter()
+            # Sample the next token.
+            output = self.model.sample(
+                logits=logits,
+                sampling_metadata=model_input.sampling_metadata,
+            )
+        elif _pt:
+            _t3 = _time.perf_counter()
+        if _pt:
+            _t4 = _time.perf_counter()
+            self._phase_prev_ret = _t4
+            print(f"PHASE fwd={_t1 - _t0:.3f} logits={_t2 - _t1:.3f} "
+                  f"d2h={_t3 - _t2:.3f} sample={_t4 - _t3:.3f}")
         #logger.info(f"sample done")
         return [output]
+
+    def _greedy_sample_on_device(self, logits, sampling_metadata):
+        """Greedy (temperature==0) sampling directly on the NPU.
+
+        The default path moves the full [1, vocab] logits to the CPU and runs
+        softmax/log_softmax over 262k entries there (~10ms/token). For greedy
+        decoding only the argmax matters, so do it on device and copy back
+        just the token ids (+ their exact logprobs, for output parity).
+        """
+        from vllm.sequence import (CompletionSequenceGroupOutput, Logprob,
+                                   SequenceOutput)
+
+        sti = sampling_metadata.selected_token_indices
+        sel = logits[sti]  # [num_samples, vocab] on NPU
+        greedy_ids = torch.argmax(sel, dim=-1)
+        chosen_lp = torch.log_softmax(sel, dim=-1, dtype=torch.float32).gather(
+            1, greedy_ids.unsqueeze(1)).squeeze(1)
+        ids = greedy_ids.tolist()
+        lps = chosen_lp.tolist()
+
+        outputs = []
+        idx = 0
+        for sg in sampling_metadata.seq_groups:
+            if not sg.do_sample:
+                outputs.append(CompletionSequenceGroupOutput([], None))
+                continue
+            seq_id = sg.seq_ids[0]
+            tid = int(ids[idx])
+            logprobs = {tid: Logprob(logprob=float(lps[idx]), rank=1)}
+            outputs.append(CompletionSequenceGroupOutput(
+                [SequenceOutput(seq_id, tid, logprobs)], None))
+            idx += 1
+        return SamplerOutput(outputs=outputs)
 
     @property
     def vocab_size(self) -> int:

@@ -19,8 +19,24 @@ def to_npu_dtype(torch_dt):
     return NPU_DT_MAPPING[torch_dt]
 
 
+_cached_default_stream = None
+
+
 def get_default_stream():
-    return torch.npu.default_stream().npu_stream
+    """Default NPU stream handle (cached).
+
+    torch.npu.default_stream() re-resolves the device index through
+    torch._utils._get_device_index (which even consults
+    torch.cuda.is_available) on EVERY call — ~120us each, and it is called
+    ~3000x per decode token. The default stream of the device does not change,
+    so cache it after the first lookup.
+    """
+    global _cached_default_stream
+    s = _cached_default_stream
+    if s is None:
+        s = torch.npu.default_stream().npu_stream
+        _cached_default_stream = s
+    return s
 
 
 def get_pointer(x):

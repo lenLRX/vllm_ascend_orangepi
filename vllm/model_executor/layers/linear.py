@@ -22,7 +22,9 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.npu.util import get_default_stream, get_pointer, to_npu_dtype, DataType
 from vllm.model_executor.layers.npu.py_npu_ops import (matmul_nz_layer, 
                                                        matmul_bias_nz_layer,
-                                                       matmul_weight_transpose_layer)
+                                                       matmul_weight_transpose_layer,
+                                                       matmul_gguf_q4_0_layer,
+                                                       matmul_gguf_q6_k_i8_layer)
 import acl
 
 logger = init_logger(__name__)
@@ -156,12 +158,36 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # GGUF Q6_K int8 lm_head path: fused dequant+matmul kernel on the
+        # int8-expanded token_embd copy (built at load by _convert_q6_k_lm_head).
+        if getattr(layer, '_q6k_i8_qweight', None) is not None:
+            M = x.shape[0]
+            N = layer._q6k_i8_n
+            K = layer._q6k_i8_k
+            x_flat = x.reshape(-1).contiguous()
+            if x_flat.dtype == torch.bfloat16:
+                x_flat = x_flat.half()
+            out = torch.empty(M * N, dtype=torch.float16, device=x.device)
+            matmul_gguf_q6_k_i8_layer(
+                get_pointer(out), get_pointer(x_flat),
+                get_pointer(layer._q6k_i8_qweight),
+                get_pointer(layer._q6k_i8_gs),
+                M, N, K, to_npu_dtype(torch.float16),
+                get_default_stream())
+            if x.dtype == torch.bfloat16:
+                out = out.reshape(M, N).bfloat16()
+            else:
+                out = out.reshape(M, N)
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         # GGUF Q4_0 path: use custom kernel with NZ-converted weights.
-        # Supports both single Q4_0 weights (_qweight_nz) and stacked
-        # Q4_0 weights (_qweight_nz_shards, used for qkv_proj / gate_up_proj).
+        # Stacked projections (qkv_proj, gate_up_proj) are converted as ONE
+        # fused weight at load time, so they also take the single-weight path
+        # below. The shards branch is kept only as a fallback for weights
+        # converted before this change.
         if hasattr(layer, '_qweight_nz_shards') and layer._qweight_nz_shards:
-            from vllm.model_executor.layers.npu.py_npu_ops import (
-                matmul_gguf_q4_0_layer)
             M = x.shape[0]
             K = x.shape[-1]  # hidden_size, same for all shards
             x_flat = x.reshape(-1).contiguous()
@@ -199,15 +225,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return out
 
         if hasattr(layer, '_qweight_nz') and layer._qweight_nz is not None:
-            from vllm.model_executor.layers.npu.py_npu_ops import (
-                matmul_gguf_q4_0_layer)
             M = x.shape[0]
             N = layer._qweight_n
             K = layer._qweight_k
             x_flat = x.reshape(-1).contiguous()
             if x_flat.dtype == torch.bfloat16:
                 x_flat = x_flat.half()
-            out = torch.empty(M * N, dtype=torch.float16, device=x.device)
+            # Pool the raw matmul output buffer per (layer, M): decode steps
+            # reuse it across tokens (all launches are stream-ordered, and
+            # the previous consumer finishes before the next matmul starts).
+            bufs = getattr(layer, '_q4_out_bufs', None)
+            if bufs is None:
+                bufs = layer._q4_out_bufs = {}
+            out = bufs.get(M)
+            if out is None:
+                out = torch.empty(M * N, dtype=torch.float16, device=x.device)
+                bufs[M] = out
             matmul_gguf_q4_0_layer(
                 get_pointer(out), get_pointer(x_flat),
                 get_pointer(layer._qweight_nz),

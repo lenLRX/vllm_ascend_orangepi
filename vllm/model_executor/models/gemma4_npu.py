@@ -112,6 +112,7 @@ _STACKED_REMAP = {"q_proj": "qkv_proj", "k_proj": "qkv_proj",
 from vllm.model_executor.layers.npu.py_npu_ops import (
     split_qkv_layer, gated_gelu_layer,
     qkv_norm_with_weight_layer, qkv_norm_no_weight_layer,
+    qkv_norm_fused_layer, rope_qk_layer,
     page_attn_gqa_dim512_layer, page_attn_dim256_gqa_layer,
     rope_standard_layer,
     add_layer, rmsnorm_layer, gelu_pytorch_tanh_layer, mul_scalar_layer,
@@ -188,13 +189,20 @@ class Gemma4RMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
         self.weight = nn.Parameter(torch.empty(hidden_size))
+        self._out_bufs = {}
 
     def forward(self, x):
         hidden_size = x.shape[-1]
         assert hidden_size % 16 == 0
         first_dim = x.numel() // hidden_size
 
-        output = torch.empty_like(x)
+        # Pooled output buffer (reused across decode steps; launches are
+        # stream-ordered and the output is consumed before the next call).
+        key = (first_dim, x.dtype)
+        output = self._out_bufs.get(key)
+        if output is None:
+            output = torch.empty_like(x)
+            self._out_bufs[key] = output
         rmsnorm_layer(get_pointer(output), get_pointer(self.weight),
                       get_pointer(x),
                       first_dim, hidden_size, self.variance_epsilon,
@@ -230,22 +238,26 @@ class Gemma4MLP(nn.Module):
         if hidden_act != "gelu_pytorch_tanh":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only gelu_pytorch_tanh is supported for Gemma4.")
+        self._gelu_bufs = {}
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         last_dim = gate_up.shape[-1] // 2
         output_shape = list(gate_up.shape)
         output_shape[-1] = last_dim
-        # gated_gelu kernel expects [all_gates, all_ups] layout per call.
-        # Call per-token (same as C++ engine) to avoid layout mismatch.
-        # Each token has gate=[0:last_dim], up=[last_dim:2*last_dim].
-        output = torch.empty(output_shape, dtype=gate_up.dtype, device=gate_up.device)
+        # gated_gelu kernel: [m, 2*last_dim] -> [m, last_dim], one batched
+        # launch for the whole token pack (gate = [0:last_dim],
+        # up = [last_dim:2*last_dim] per row).
+        key = tuple(output_shape)
+        output = self._gelu_bufs.get(key)
+        if output is None:
+            output = torch.empty(output_shape, dtype=gate_up.dtype, device=gate_up.device)
+            self._gelu_bufs[key] = output
         flat_in = gate_up.reshape(-1, last_dim * 2)
-        flat_out = output.reshape(-1, last_dim)
-        for t in range(flat_in.shape[0]):
-            gated_gelu_layer(get_pointer(flat_out[t]), get_pointer(flat_in[t]),
-                             last_dim, to_npu_dtype(gate_up.dtype),
-                             get_default_stream())
+        gated_gelu_layer(get_pointer(output), get_pointer(flat_in),
+                         flat_in.shape[0], last_dim,
+                         to_npu_dtype(gate_up.dtype),
+                         get_default_stream())
         x, _ = self.down_proj(output)
         return x
 
@@ -298,6 +310,12 @@ class Gemma4Attention(nn.Module):
         # Q/K norms with learnable weights, V norm without
         self.q_norm_weight = nn.Parameter(torch.empty(self.head_dim))
         self.k_norm_weight = nn.Parameter(torch.empty(self.head_dim))
+
+        # Decode buffer pool: the forward allocates ~10 intermediates per
+        # layer per token; with static M=1 decode shapes they can be reused
+        # across steps (all kernel launches are stream-ordered, so reuse is
+        # safe). Keyed by name; reallocated only when the shape changes.
+        self._bufs = {}
 
         # Determine layer type and sliding window
         self.is_sliding = False
@@ -385,6 +403,13 @@ class Gemma4Attention(nn.Module):
         # stores it, then model.npu() tries to move it again.
         return torch.from_numpy(result_np.copy())
 
+    def _get_buf(self, key, shape, dtype):
+        b = self._bufs.get(key)
+        if b is None or b.shape != shape or b.dtype != dtype:
+            b = torch.empty(shape, dtype=dtype, device="npu")
+            self._bufs[key] = b
+        return b
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -395,9 +420,9 @@ class Gemma4Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         qkv_last_dim = qkv.shape[-1]
         token_num = qkv.reshape(-1, qkv_last_dim).shape[0]
-        q = torch.empty(qkv.shape[:-1] + (self.q_size,), dtype=qkv.dtype, device="npu")
-        k = torch.empty(qkv.shape[:-1] + (self.kv_size,), dtype=qkv.dtype, device="npu")
-        v = torch.empty(qkv.shape[:-1] + (self.kv_size,), dtype=qkv.dtype, device="npu")
+        q = self._get_buf('q', qkv.shape[:-1] + (self.q_size,), qkv.dtype)
+        k = self._get_buf('k', qkv.shape[:-1] + (self.kv_size,), qkv.dtype)
+        v = self._get_buf('v', qkv.shape[:-1] + (self.kv_size,), qkv.dtype)
 
         split_qkv_layer(get_pointer(q), get_pointer(k),
                         get_pointer(v), get_pointer(qkv),
@@ -413,40 +438,40 @@ class Gemma4Attention(nn.Module):
         # Apply Q/K/V per-head norms
         # Gemma4 uses shared weight [head_dim] across all heads.
         # The kernel's shared_weight=True flag handles this internally.
-        q_normed = torch.empty_like(q_reshaped)
-        k_normed = torch.empty_like(k_reshaped)
-
-        qkv_norm_with_weight_layer(
-            get_pointer(q_normed), get_pointer(q_reshaped),
-            get_pointer(self.q_norm_weight), token_num, self.num_heads,
-            self.head_dim, self.config.rms_norm_eps,
-            True,  # shared_weight
-            to_npu_dtype(hidden_states.dtype), get_default_stream())
+        q_normed = self._get_buf('q_normed', q_reshaped.shape, q_reshaped.dtype)
+        k_normed = self._get_buf('k_normed', k_reshaped.shape, k_reshaped.dtype)
 
         if not self.is_kv_shared_layer:
+            v_normed = self._get_buf('v_normed', v_reshaped.shape, v_reshaped.dtype)
+            # One fused launch issues the q/k/v norm kernels back to back.
+            qkv_norm_fused_layer(
+                get_pointer(q_normed), get_pointer(k_normed),
+                get_pointer(v_normed), get_pointer(q_reshaped),
+                get_pointer(k_reshaped), get_pointer(v_reshaped),
+                get_pointer(self.q_norm_weight),
+                get_pointer(self.k_norm_weight),
+                token_num, self.num_heads, self.num_kv_heads,
+                self.head_dim, self.config.rms_norm_eps,
+                to_npu_dtype(hidden_states.dtype), get_default_stream())
+        else:
+            # KV-shared layers only need the Q norm (K/V come from the
+            # shared cache written by L13/L14).
             qkv_norm_with_weight_layer(
-                get_pointer(k_normed), get_pointer(k_reshaped),
-                get_pointer(self.k_norm_weight), token_num, self.num_kv_heads,
+                get_pointer(q_normed), get_pointer(q_reshaped),
+                get_pointer(self.q_norm_weight), token_num, self.num_heads,
                 self.head_dim, self.config.rms_norm_eps,
                 True,  # shared_weight
-                to_npu_dtype(hidden_states.dtype), get_default_stream())
-
-            v_normed = torch.empty_like(v_reshaped)
-            qkv_norm_no_weight_layer(
-                get_pointer(v_normed), get_pointer(v_reshaped),
-                token_num, self.num_kv_heads, self.head_dim,
-                self.config.rms_norm_eps,
                 to_npu_dtype(hidden_states.dtype), get_default_stream())
 
         # Apply RoPE per batch item — each sequence may have a different
         # starting position (e.g. decode with multiple sequences at different
         # stages, or prefill where each sequence resets to position 0).
         q_flat = q_normed.reshape(token_num, self.q_size)
-        q_roped_flat = torch.empty(token_num, self.q_size, dtype=q_flat.dtype, device="npu")
+        q_roped_flat = self._get_buf('q_roped', (token_num, self.q_size), q_flat.dtype)
 
         if not self.is_kv_shared_layer:
             k_flat = k_normed.reshape(token_num, self.kv_size)
-            k_roped_flat = torch.empty(token_num, self.kv_size, dtype=k_flat.dtype, device="npu")
+            k_roped_flat = self._get_buf('k_roped', (token_num, self.kv_size), k_flat.dtype)
 
         batch_size = len(attn_metadata.seq_lens)
         token_offset = 0
@@ -454,21 +479,24 @@ class Gemma4Attention(nn.Module):
             seq_len = attn_metadata.seq_lens[batch_i]
             seq_start_pos = attn_metadata.start_positions[batch_i]
 
-            # Q RoPE for this batch item
-            rope_standard_layer(
-                get_pointer(q_roped_flat[token_offset:token_offset + seq_len, ...]),
-                get_pointer(self.freqs_cis),
-                get_pointer(q_flat[token_offset:token_offset + seq_len, ...]),
-                seq_start_pos, seq_len, self.num_heads, self.q_size,
-                to_npu_dtype(hidden_states.dtype), get_default_stream())
-
-            # K RoPE for this batch item
             if not self.is_kv_shared_layer:
-                rope_standard_layer(
+                # Q+K RoPE in one batched call (two kernel launches in C++).
+                rope_qk_layer(
+                    get_pointer(q_roped_flat[token_offset:token_offset + seq_len, ...]),
                     get_pointer(k_roped_flat[token_offset:token_offset + seq_len, ...]),
                     get_pointer(self.freqs_cis),
+                    get_pointer(q_flat[token_offset:token_offset + seq_len, ...]),
                     get_pointer(k_flat[token_offset:token_offset + seq_len, ...]),
-                    seq_start_pos, seq_len, self.num_kv_heads, self.kv_size,
+                    seq_start_pos, seq_len, self.num_heads, self.num_kv_heads,
+                    self.q_size, self.kv_size,
+                    to_npu_dtype(hidden_states.dtype), get_default_stream())
+            else:
+                # KV-shared layers only rope Q.
+                rope_standard_layer(
+                    get_pointer(q_roped_flat[token_offset:token_offset + seq_len, ...]),
+                    get_pointer(self.freqs_cis),
+                    get_pointer(q_flat[token_offset:token_offset + seq_len, ...]),
+                    seq_start_pos, seq_len, self.num_heads, self.q_size,
                     to_npu_dtype(hidden_states.dtype), get_default_stream())
 
             token_offset += seq_len
@@ -495,13 +523,21 @@ class Gemma4Attention(nn.Module):
         block_size = self.attn.block_size
         kernel_n_tile = 64  # matches both dim256 and dim512 kernel n_tile
 
-        attn_output = torch.empty(q.shape, dtype=q.dtype, device="npu")
+        attn_output = self._get_buf('attn_out', q.shape, q.dtype)
 
         flat_seq_offset = 0
         batch_size = len(attn_metadata.seq_lens)
-        # Retain per-sequence page tables until all kernels have been launched,
-        # otherwise an async kernel may read freed/reused memory.
-        page_table_tensors = []
+        # Page tables are identical for every layer in a step and only change
+        # when a new KV block is allocated (every block_size tokens). Cache
+        # the device tensor per table content on the attention module so the
+        # blocking torch.tensor(device='npu') H2D runs ~once per 64 tokens
+        # instead of once per layer per token. Cached tensors are never freed
+        # while in use, and all launches are stream-ordered, so no per-layer
+        # torch.npu.synchronize() is needed (it used to drain the whole
+        # pipeline 35x per token).
+        pt_cache = getattr(self, '_page_table_cache', None)
+        if pt_cache is None:
+            pt_cache = self._page_table_cache = {}
         for batch_i in range(batch_size):
             curr_seq_len = attn_metadata.seq_lens[batch_i]
             curr_offset = attn_metadata.offsets[batch_i]
@@ -539,8 +575,13 @@ class Gemma4Attention(nn.Module):
             page_table_list = list(curr_block_table_host[:num_kernel_entries])
             while len(page_table_list) < num_kernel_entries:
                 page_table_list.append(curr_block_table_host[-1])
-            page_table_npu = torch.tensor(page_table_list, dtype=torch.long, device="npu")
-            page_table_tensors.append(page_table_npu)
+            pt_key = (batch_i, tuple(page_table_list))
+            page_table_npu = pt_cache.get(pt_key)
+            if page_table_npu is None:
+                page_table_npu = torch.tensor(page_table_list, dtype=torch.long, device="npu")
+                if len(pt_cache) > 8:
+                    pt_cache.clear()
+                pt_cache[pt_key] = page_table_npu
 
             qk_scale = 1.0
 
@@ -569,10 +610,6 @@ class Gemma4Attention(nn.Module):
                     to_npu_dtype(q.dtype), get_default_stream())
 
             flat_seq_offset += curr_seq_len
-
-        if page_table_tensors:
-            torch.npu.synchronize()
-
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -684,6 +721,18 @@ class Gemma4DecoderLayer(nn.Module):
         self.register_buffer("layer_scalar", torch.empty(1))
         self._layer_scalar_f = 1.0
 
+        # Decode buffer pool for the residual-add / PLE / mul_scalar
+        # intermediates (reused across steps; elementwise ops on the same
+        # buffer are index-wise safe and all launches are stream-ordered).
+        self._bufs = {}
+
+    def _get_buf(self, key, ref):
+        b = self._bufs.get(key)
+        if b is None or b.shape != ref.shape or b.dtype != ref.dtype:
+            b = torch.empty_like(ref)
+            self._bufs[key] = b
+        return b
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -711,7 +760,7 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         # Add first residual
-        new_residual = torch.empty_like(hidden_states)
+        new_residual = self._get_buf('res', hidden_states)
         add_layer(get_pointer(new_residual),
                   get_pointer(hidden_states), get_pointer(residual),
                   hidden_states.numel(), to_npu_dtype(hidden_states.dtype),
@@ -724,7 +773,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         # Add second residual
-        new_residual = torch.empty_like(hidden_states)
+        new_residual = self._get_buf('res', hidden_states)
         add_layer(get_pointer(new_residual),
                   get_pointer(hidden_states), get_pointer(residual),
                   hidden_states.numel(), to_npu_dtype(hidden_states.dtype),
@@ -736,13 +785,13 @@ class Gemma4DecoderLayer(nn.Module):
         if per_layer_input is not None and self.per_layer_input_gate is not None:
             gate, _ = self.per_layer_input_gate(hidden_states)
             # Apply gelu_pytorch_tanh activation
-            gated = torch.empty_like(gate)
+            gated = self._get_buf('gated', gate)
             gelu_pytorch_tanh_layer(get_pointer(gated), get_pointer(gate),
                                      gate.numel(),
                                      to_npu_dtype(gate.dtype),
                                      get_default_stream())
             # Element-wise multiply: gated * per_layer_input
-            ple_mul = torch.empty_like(gated)
+            ple_mul = self._get_buf('ple_mul', gated)
             mul_layer(get_pointer(ple_mul), get_pointer(gated),
                       get_pointer(per_layer_input),
                       gated.numel(), to_npu_dtype(gated.dtype),
@@ -751,7 +800,7 @@ class Gemma4DecoderLayer(nn.Module):
             ple_proj, _ = self.per_layer_projection(ple_mul)
             ple_out = self.post_per_layer_input_norm(ple_proj)
             # Add PLE contribution
-            new_hidden = torch.empty_like(hidden_states)
+            new_hidden = self._get_buf('hidden', hidden_states)
             add_layer(get_pointer(new_hidden),
                       get_pointer(hidden_states), get_pointer(ple_out),
                       hidden_states.numel(), to_npu_dtype(hidden_states.dtype),
@@ -766,7 +815,7 @@ class Gemma4DecoderLayer(nn.Module):
         # buffer (it is uninitialized torch.empty — see __init__).
         if self._layer_scalar_f is None:
             self._layer_scalar_f = 1.0
-        new_hidden = torch.empty_like(hidden_states)
+        new_hidden = self._get_buf('hidden', hidden_states)
         mul_scalar_layer(get_pointer(new_hidden), get_pointer(hidden_states),
                          hidden_states.numel(),
                          self._layer_scalar_f,
@@ -982,6 +1031,15 @@ class Gemma4Model(nn.Module):
             ple_num_layers = self.config.num_hidden_layers
             ple_block_bytes = (self.hidden_size_per_layer_input
                                * per_layer_inputs.element_size())
+            # One pooled slice buffer reused across layers (each layer's
+            # ple_slice write is consumed by its PLE mul before the next
+            # layer's slice lands; launches are stream-ordered).
+            buf = getattr(self, '_ple_slice_buf', None)
+            if (buf is None or buf.shape[0] != ple_num_tokens
+                    or buf.dtype != per_layer_inputs.dtype):
+                buf = per_layer_inputs.new_empty(
+                    (ple_num_tokens, self.hidden_size_per_layer_input))
+                self._ple_slice_buf = buf
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -992,8 +1050,7 @@ class Gemma4Model(nn.Module):
                 # contiguous [tokens, dim] buffer.  layer index i is a runtime
                 # arg -> a single compiled kernel serves every layer (no
                 # per-offset TBE StridedSliceD JIT compile).
-                layer_per_input = per_layer_inputs.new_empty(
-                    (ple_num_tokens, self.hidden_size_per_layer_input))
+                layer_per_input = buf
                 ple_slice_layer(
                     get_pointer(layer_per_input),
                     get_pointer(per_layer_inputs),
@@ -1150,41 +1207,83 @@ class Gemma4Model(nn.Module):
             import logging
             logging.getLogger(__name__).warning(
                 "GGUF: no .weight on %s for Q6_K dequant", type(parent).__name__)
+        # Stash the raw Q6_K bytes of token_embd for the fused Q6_K int8
+        # lm_head kernel (it is the only [K=1536, N=262144] Q6_K tensor).
+        if N == 262144 and K == 1536:
+            parent._q6k_raw = raw_u8.ravel().copy()
+            parent._q6k_n = N
+            parent._q6k_k = K
+
+    def _convert_q6_k_lm_head(self):
+        """Convert the tied token_embd to the fused Q6_K int8 lm_head layout.
+
+        The GGUF stores token_embd as Q6_K; the default path dequantizes it
+        to fp16 (805 MB/token). The fused kernel reads an int8-expanded copy
+        (~453 MB/token) produced by convert_gguf_q6_k_i8 — numerically the
+        SAME values as the shipped Q6_K (int8(q6-32) with fp16 group scales).
+        Gated by env GEMMA4_LMHEAD_Q6K (default on; "0" disables).
+        """
+        import os
+        if os.environ.get("GEMMA4_LMHEAD_Q6K", "1") != "1":
+            return
+        from vllm.model_executor.layers.npu.py_npu_ops import (
+            convert_gguf_q6_k_i8)
+        emb = getattr(self, 'embed_tokens', None)
+        if emb is None or not hasattr(emb, '_q6k_raw'):
+            return
+        N, K = emb._q6k_n, emb._q6k_k
+        N_pad = (N + 31) // 32 * 32
+        K_pad = (K + 15) // 16 * 16
+        i8 = np.zeros(K_pad * N_pad, dtype=np.int8)
+        gs = np.zeros(K_pad * N_pad // 16, dtype=np.uint16)
+        convert_gguf_q6_k_i8(emb._q6k_raw, i8, gs, N, K)
+        emb._q6k_i8_qweight = torch.from_numpy(i8.view(np.uint8)).npu()
+        emb._q6k_i8_gs = torch.from_numpy(gs.view(np.float16)).npu()
+        emb._q6k_i8_n = N
+        emb._q6k_i8_k = K
+        del emb._q6k_raw
 
     def _convert_q4_0_weights(self):
         """Convert all stored Q4_0 weights to NZ format on NPU."""
         if not _gguf_q4_0_available:
             return
         for mod in self.modules():
-            # Handle sharded Q4_0 (qkv_proj, gate_up_proj)
-            if hasattr(mod, '_qweight_raw_shards') and not hasattr(mod, '_qweight_nz_shards'):
-                mod._qweight_nz_shards = {}
-                mod._scales_shards = {}
-                # NOTE: _qweight_shard_n and _qweight_shard_k were already
-                # populated in _load_gguf_quant_weight — do NOT overwrite!
-                # Validate that N and K were stored for each shard before
-                # conversion.  (k_eq_v layers may lack k/v shards.)
-                valid_shards = {}
-                for sid in list(mod._qweight_raw_shards.keys()):
+            # Sharded Q4_0 (qkv_proj, gate_up_proj): the GGUF raw blocks are
+            # row-major over N, so concatenating the shard raws yields a valid
+            # [sum(N), K] Q4_0 tensor. Convert ONCE -> a single fused matmul
+            # per projection at runtime (no per-shard launches, no torch.cat).
+            if hasattr(mod, '_qweight_raw_shards') and not hasattr(mod, '_qweight_nz'):
+                shard_order = (["q", "k", "v"] if any(
+                    k in mod._qweight_raw_shards for k in ("q", "k", "v"))
+                    else sorted(mod._qweight_raw_shards.keys()))
+                raws, N_total, K = [], 0, 0
+                for sid in shard_order:
+                    if sid not in mod._qweight_raw_shards:
+                        continue
                     if sid not in mod._qweight_shard_n:
                         continue
                     N = int(mod._qweight_shard_n.get(sid, 0))
                     K = int(mod._qweight_shard_k.get(sid, 0))
                     if N <= 0 or K <= 0:
                         continue
-                    valid_shards[sid] = (N, K, mod._qweight_raw_shards[sid])
-                for sid, (N, K, raw) in valid_shards.items():
-                    nz_bytes = K * N // 2
+                    raws.append(mod._qweight_raw_shards[sid])
+                    N_total += N
+                if raws:
+                    raw = np.concatenate(raws) if len(raws) > 1 else raws[0]
+                    nz_bytes = K * N_total // 2
                     qw_nz = np.zeros(nz_bytes, dtype=np.uint8)
-                    scales = np.zeros(K // 32 * N, dtype=np.uint16)
-                    convert_gguf_q4_0_qweight(raw, qw_nz, scales, N, K)
-                    mod._qweight_nz_shards[sid] = torch.from_numpy(
+                    scales = np.zeros(K // 32 * N_total, dtype=np.uint16)
+                    convert_gguf_q4_0_qweight(raw, qw_nz, scales, N_total, K)
+                    mod._qweight_nz = torch.from_numpy(
                         qw_nz.ravel()).npu()
-                    mod._scales_shards[sid] = torch.from_numpy(
+                    mod._scales = torch.from_numpy(
                         scales.ravel().view(np.float16)).npu()
-                    mod._qweight_shard_n[sid] = N
-                    mod._qweight_shard_k[sid] = K
+                    mod._qweight_n = N_total
+                    mod._qweight_k = K
                 del mod._qweight_raw_shards
+                for attr in ('_qweight_shard_n', '_qweight_shard_k'):
+                    if hasattr(mod, attr):
+                        delattr(mod, attr)
 
             # Handle unsharded Q4_0 (down_proj, o_proj, etc.)
             if hasattr(mod, '_qweight_raw') and not hasattr(mod, '_qweight_nz'):
@@ -1204,7 +1303,7 @@ class Gemma4Model(nn.Module):
                 del mod._qweight_raw  # free CPU memory
 
     def _inject_missing_kv_weights(self):
-        """Inject k_proj/v_proj for KV-shared layers (15-34) missing from GGUF.
+        """Inject raw k/v shards for KV-shared layers (15-34) missing from GGUF.
 
         Gemma4 E2B uses shared KV: layers >= n_layer_kv_from_start (=15) reuse
         an earlier layer's K/V (they have no k_proj/v_proj of their own in the
@@ -1217,9 +1316,14 @@ class Gemma4Model(nn.Module):
 
         So instead of loading the bf16 model and re-quantizing (which produced
         wrong k/v - the re-quant differs from the GGUF's own Q4_0 layer-13/14,
-        causing garbled output), we COPY the already-converted Q4_0 NZ k/v
-        shards + scales from layer 13/14 to each shared layer. This is
-        bit-exact with llama.cpp and needs no bf16 model.
+        causing garbled output), we COPY the source layer's raw GGUF k/v shard
+        bytes. The later stacked NZ conversion then produces bit-identical
+        k/v to the source layer. This runs BEFORE _convert_q4_0_weights so the
+        raw shards are still available. Cloning (rather than referencing) keeps
+        the shared layer's qkv output shape correct: its k/v columns are
+        discarded at runtime (is_kv_shared_layer -> _should_write_kv=False,
+        attention reads from L13/L14's cache) but must exist for the fused
+        qkv matmul to produce the right output layout.
         """
         num_kv_shared = getattr(self.config, "num_kv_shared_layers", 0)
         if num_kv_shared <= 0:
@@ -1238,7 +1342,7 @@ class Gemma4Model(nn.Module):
         _log = logging.getLogger(__name__)
 
         # Sanity: the two reuse sources (13 SWA, 14 dense) must exist and have
-        # converted k/v shards by now (this runs after _convert_q4_0_weights).
+        # raw k/v shards (this runs before _convert_q4_0_weights).
         def get_src(il):
             return first_kv_shared - (2 if is_swa[il] else 1)
 
@@ -1248,33 +1352,26 @@ class Gemma4Model(nn.Module):
                 break
             layer = self.layers[il]
             qkv = layer.self_attn.qkv_proj
-            if hasattr(qkv, '_qweight_nz_shards') and 'k' in qkv._qweight_nz_shards:
+            if hasattr(qkv, '_qweight_raw_shards') and 'k' in qkv._qweight_raw_shards:
                 continue  # already has k (shouldn't happen for shared layers)
 
             src = get_src(il)
             src_qkv = self.layers[src].self_attn.qkv_proj
-            if not (hasattr(src_qkv, '_qweight_nz_shards')
-                    and 'k' in src_qkv._qweight_nz_shards
-                    and 'v' in src_qkv._qweight_nz_shards):
-                _log.warning("GGUF: layer %d reuse source %d has no converted "
+            if not (hasattr(src_qkv, '_qweight_raw_shards')
+                    and 'k' in src_qkv._qweight_raw_shards
+                    and 'v' in src_qkv._qweight_raw_shards):
+                _log.warning("GGUF: layer %d reuse source %d has no raw "
                              "k/v shards; skipping", il, src)
                 continue
 
-            if not hasattr(qkv, '_qweight_nz_shards'):
-                qkv._qweight_nz_shards = {}
-                qkv._scales_shards = {}
+            if not hasattr(qkv, '_qweight_raw_shards'):
+                qkv._qweight_raw_shards = {}
                 qkv._qweight_shard_n = {}
                 qkv._qweight_shard_k = {}
-            # Copy (clone) the source's k/v NZ shards + scales + dims to this
-            # shared layer. Clone rather than reference: the shared layer's k/v
-            # output is discarded (is_kv_shared_layer -> _should_write_kv=False,
-            # attention reads from L13/L14's cache), so the values don't affect
-            # the result - but the weights MUST exist with the right shape for
-            # the qkv matmul to produce the correct output size. Cloning avoids
-            # aliasing if any post-load step mutates per-layer weight tensors.
+            # Copy the source's raw k/v GGUF bytes + dims.
             for kvk in ('k', 'v'):
-                qkv._qweight_nz_shards[kvk] = src_qkv._qweight_nz_shards[kvk].clone()
-                qkv._scales_shards[kvk] = src_qkv._scales_shards[kvk].clone()
+                qkv._qweight_raw_shards[kvk] = \
+                    src_qkv._qweight_raw_shards[kvk].copy()
                 qkv._qweight_shard_n[kvk] = src_qkv._qweight_shard_n[kvk]
                 qkv._qweight_shard_k[kvk] = src_qkv._qweight_shard_k[kvk]
             injected += 1
@@ -1441,16 +1538,34 @@ class Gemma4Model(nn.Module):
                        for m in self.modules())
 
         if _is_gguf:
-            # Convert GGUF Q4_0 weights to NZ format
+            # Inject missing raw k/v for KV-shared layers (15-34) BEFORE
+            # conversion so the stacked convert sees complete qkv shards.
+            self._inject_missing_kv_weights()
+
+            # Convert GGUF Q4_0 weights to NZ format (shards fused: one
+            # stacked conversion per projection -> one matmul at runtime)
             self._convert_q4_0_weights()
 
-            # Inject missing k/v for KV-shared layers (15-34) from bf16 model
-            self._inject_missing_kv_weights()
+            # Convert the tied token_embd to the fused Q6_K int8 lm_head
+            # layout (behind env flag, default on).
+            self._convert_q6_k_lm_head()
 
             # Post-load: transpose non-Q4_0 weights to NZ format.
             # The GGUF loader doesn't call process_weights_after_loading,
             # but NPU linear methods need NZ-transposed weights.
             self._post_load_process_weights()
+
+        # Fast-path attrs for UnquantizedLinearMethod.apply: the per-call
+        # hasattr(layer, '_qweight_nz*') checks hit nn.Module.__getattr__ (a
+        # full parameters/buffers/modules scan) when the attr is missing.
+        # Pre-seeding them as None makes every check a cheap __dict__ hit.
+        from vllm.model_executor.layers.linear import LinearBase
+        for mod in self.modules():
+            if isinstance(mod, LinearBase):
+                if '_qweight_nz' not in mod.__dict__:
+                    mod._qweight_nz = None
+                if '_qweight_nz_shards' not in mod.__dict__:
+                    mod._qweight_nz_shards = None
 
 
 class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
