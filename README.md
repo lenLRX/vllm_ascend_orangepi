@@ -14,6 +14,11 @@ export MODELSCOPE_CACHE=/ssd/hf_home
 ```
 vllm也支持使用本地已经下载好的模型，直接设置绝对路径即可
 
+> ⚠️ **当前版本可用性说明**：本 release 仅保证 Gemma4 系列可用（见下方
+> 「Gemma4 支持」一节）。以下 Qwen2 系列模型（DeepSeek-R1-Distill-Qwen-1.5B、
+> Qwen2.5-7B-Instruct-AWQ 等）在当前版本暂时不可用（能加载但输出异常），
+> 正在修复中，将在后续版本恢复。
+
 ### OpenAI http api
 ```bash
 # 自动下载模型

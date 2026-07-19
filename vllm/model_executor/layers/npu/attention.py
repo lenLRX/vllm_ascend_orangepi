@@ -163,7 +163,8 @@ class Attention(nn.Module):
                                 get_pointer(kv_cache[0, ...]),
                                 get_pointer(kv_cache[1, ...]),
                                 curr_seq_len, curr_pos, curr_offset, self.group_size,
-                                self.num_kv_heads, self.head_size, to_npu_dtype(query.dtype), get_default_stream())
+                                self.num_kv_heads, self.head_size, True,
+                                to_npu_dtype(query.dtype), get_default_stream())
 
 
             flat_seq_offset += curr_seq_len

@@ -268,7 +268,10 @@ def _prepare_seq_groups(
 
         if seq_group_metadata.is_prompt:
             if sampling_params.seed is not None:
-                generator = torch.Generator(device=device).manual_seed(
+                # Sampling is forced onto CPU in this build (see
+                # sampler.py "force cpu now"), so the generator must be a
+                # CPU generator or exponential_/uniform_ reject it.
+                generator = torch.Generator(device='cpu').manual_seed(
                     sampling_params.seed)
                 if generators is not None:
                     generators[seq_group_metadata.request_id] = generator

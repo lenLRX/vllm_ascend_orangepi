@@ -214,9 +214,13 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
             assert seq_group_metadata.block_tables is not None
             #logger.info(f"seq_ids {seq_ids}, block_tables: {seq_group_metadata.block_tables}")
             block_table = seq_group_metadata.block_tables[seq_id]
-            # Block table NPU tensor is never used downstream — only the CPU
-            # list is indexed. Pass (None, host_list) to eliminate .npu() JIT trigger.
-            input_block_tables.append((None, block_table))
+            # The shared Attention layer passes the on-device block table to
+            # page_attn_gqa_layer. Upload with empty+copy_ to avoid the
+            # .npu() JIT trigger.
+            bt_npu = torch.empty(len(block_table), dtype=torch.long,
+                                 device=self.device)
+            bt_npu.copy_(torch.tensor(block_table, dtype=torch.long))
+            input_block_tables.append((bt_npu, block_table))
             #assert len(block_table) == 1
 
             mm_data = seq_group_metadata.multi_modal_data
@@ -291,9 +295,13 @@ class NPUModelRunner(ModelRunnerBase[ModelInputForNPU]):
                 input_lengths.append(1)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
-                # Block table NPU tensor is never used downstream — only the
-                # CPU list is indexed. Pass (None, host_list) to eliminate .npu() JIT trigger.
-                input_block_tables.append((None, block_table))
+                # The shared Attention layer passes the on-device block table
+                # to page_attn_gqa_layer. Upload with empty+copy_ to avoid
+                # the .npu() JIT trigger.
+                bt_npu = torch.empty(len(block_table), dtype=torch.long,
+                                     device=self.device)
+                bt_npu.copy_(torch.tensor(block_table, dtype=torch.long))
+                input_block_tables.append((bt_npu, block_table))
 
         # Use torch.empty + copy_ to avoid torch.tensor(..., device=npu) JIT trigger
         total_tokens = len(input_tokens)

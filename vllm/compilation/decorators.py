@@ -77,9 +77,21 @@ def support_torch_compile(
         if inferred_dynamic_arg_dims is None:
             inferred_dynamic_arg_dims = {}
             for k, v in sig.parameters.items():
-                if v.annotation in [
+                annotation = v.annotation
+                if isinstance(annotation, str):
+                    # Annotations may have been stringified (e.g. when the
+                    # module was compiled with `from __future__ import
+                    # annotations`). Normalize to the canonical spelling.
+                    annotation = annotation.strip("'\"").replace(
+                        "typing.", "").replace(" ", "")
+                if annotation in [
                         torch.Tensor, Optional[torch.Tensor],
-                        IntermediateTensors, Optional[IntermediateTensors]
+                        IntermediateTensors, Optional[IntermediateTensors],
+                        "torch.Tensor", "Optional[torch.Tensor]",
+                        "IntermediateTensors",
+                        "Optional[IntermediateTensors]",
+                        "Union[torch.Tensor,None]",
+                        "Union[IntermediateTensors,None]"
                 ]:
                     inferred_dynamic_arg_dims[k] = 0
 
