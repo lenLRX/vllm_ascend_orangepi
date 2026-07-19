@@ -21,18 +21,37 @@ vllm也支持使用本地已经下载好的模型，直接设置绝对路径即�
 
 ### OpenAI http api
 ```bash
-# 自动下载模型
-python -m vllm.entrypoints.openai.api_server --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-# 使用本地已下载模型
-python -m vllm.entrypoints.openai.api_server --model /ssd/models/Qwen2.5-7B-Instruct-AWQ/
+# Gemma4 E2B GGUF Q4_0（推荐）
+python -m vllm.entrypoints.openai.api_server \
+  --model /ssd/models/gemma-4-E2B-it-qat-q4_0-gguf/gemma-4-E2B_q4_0-it.gguf \
+  --tokenizer /ssd/models/gemma-4-E2B-it-qat-q4_0-gguf \
+  --served-model-name gemma-4-E2B-q4_0 \
+  --trust-remote-code --dtype float16 --max-model-len 2048 \
+  --gpu-memory-utilization 0.9 --enforce-eager --block-size 64 \
+  --port 8000
+
+# Gemma4 E2B bf16
+python -m vllm.entrypoints.openai.api_server \
+  --model /ssd/models/gemma-4-E2B-it \
+  --served-model-name gemma-4-E2B-bf16 \
+  --trust-remote-code --dtype bfloat16 --max-model-len 2048 \
+  --gpu-memory-utilization 0.9 --enforce-eager --block-size 64 \
+  --port 8000
 ```
 ### python脚本
 ```python
 from vllm import LLM, SamplingParams
 
-sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=16, seed=42)
-llm = LLM(model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
+model_dir = '/ssd/models/gemma-4-E2B-it-qat-q4_0-gguf'
+llm = LLM(
+    model=f'{model_dir}/gemma-4-E2B_q4_0-it.gguf',
+    tokenizer=model_dir,
+    trust_remote_code=True,
+    dtype='float16', max_model_len=2048,
+    gpu_memory_utilization=0.9, enforce_eager=True, block_size=64,
+)
 
+sampling_params = SamplingParams(temperature=0, top_p=1.0, max_tokens=16)
 prompts = [
     "AI的未来是",
     "The weather today"
